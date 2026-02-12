@@ -30,8 +30,8 @@ def build_default_ray_dirs() -> np.ndarray:
     dirs: List[np.ndarray] = []
 
     # 16 rays on horizontal plane
-    for deg in range(0, 360, 22):
-        rad = np.deg2rad(deg)
+    for deg in np.linspace(0.0, 360.0, 16, endpoint=False):
+        rad = np.deg2rad(float(deg))
         dirs.append(np.array([np.cos(rad), np.sin(rad), 0.0], dtype=float))
 
     # Tilted rays (up/down, front/left/back/right)
@@ -188,6 +188,24 @@ class SensorSuite:
             self._draw_debug_rays(rays["ray_from"], rays["ray_to"], rays["ray_dists"])
 
         return packet
+
+    def sense_obstacles(self, obs: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        """
+        Lightweight obstacle-only interface for planners.
+        """
+        state = self._read_state(obs)
+        rays = self._sense_rays(state)
+        collision = self._sense_collision()
+        return {
+            "ray_dists": rays["ray_dists"],
+            "ray_dirs_body": self.ray_dirs_body.copy(),
+            "ray_hit_ids": rays["ray_hit_ids"],
+            "min_dist": float(rays["min_dist"]),
+            "min_dir_body": rays["min_dir_body"],
+            "collision": bool(collision["collision"]),
+            "contact_body_ids": collision["contact_body_ids"],
+            "closest_obstacle_dist": float(collision["closest_obstacle_dist"]),
+        }
 
     def _read_state(self, obs: Optional[np.ndarray]) -> SelfState:
         if obs is not None:
