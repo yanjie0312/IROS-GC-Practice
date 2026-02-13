@@ -1,8 +1,9 @@
 # my_project/env/sensors.py
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pybullet as p
@@ -45,6 +46,33 @@ def build_default_ray_dirs() -> np.ndarray:
     return ray_dirs / norms
 
 
+def _as_vec3(value: float | Sequence[float] | None, default_scalar: float = 0.0) -> np.ndarray:
+    if value is None:
+        return np.array([default_scalar, default_scalar, default_scalar], dtype=float)
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size == 1:
+        return np.array([arr[0], arr[0], arr[0]], dtype=float)
+    if arr.size != 3:
+        raise ValueError("Expected scalar or 3-vector")
+    return arr.copy()
+
+
+def _wrap_to_pi(angles: np.ndarray) -> np.ndarray:
+    return (np.asarray(angles, dtype=float) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _clone_obj(obj: Any) -> Any:
+    if isinstance(obj, np.ndarray):
+        return obj.copy()
+    if isinstance(obj, dict):
+        return {k: _clone_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clone_obj(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_clone_obj(v) for v in obj)
+    return obj
+
+
 @dataclass
 class SelfState:
     pos: np.ndarray
@@ -61,6 +89,9 @@ class SensorSuite:
     - obstacle rays
     - collision / closest distance
     - target detection (GT / camera segmentation / hybrid)
+    - uncertainty injection (noise/bias/dropout/FN/FP)
+    - delayed/dropped packets
+    - lightweight pose estimator (dead-reckoning + complementary update)
     """
 
     def __init__(
@@ -82,6 +113,32 @@ class SensorSuite:
         cam_near: float = 0.03,
         cam_far: float = 5.0,
         enable_debug_rays: bool = False,
+        # ---------- uncertainty: state ----------
+        state_noise_std_pos: float | Sequence[float] = 0.0,
+        state_noise_std_rpy: float | Sequence[float] = 0.0,
+        state_noise_std_vel: float | Sequence[float] = 0.0,
+        state_noise_std_ang_vel: float | Sequence[float] = 0.0,
+        state_bias_pos: float | Sequence[float] | None = None,
+        state_bias_rpy: float | Sequence[float] | None = None,
+        state_bias_vel: float | Sequence[float] | None = None,
+        state_bias_ang_vel: float | Sequence[float] | None = None,
+        # ---------- uncertainty: rays ----------
+        ray_noise_std: float = 0.0,
+        ray_bias: float = 0.0,
+        ray_dropout_prob: float = 0.0,
+        # ---------- uncertainty: targets ----------
+        target_false_negative_prob: float = 0.0,
+        target_false_positive_prob: float = 0.0,
+        target_pos_noise_std: float | Sequence[float] = 0.0,
+        target_pos_bias: float | Sequence[float] | None = None,
+        # ---------- packet delay/loss ----------
+        measurement_delay_steps: int = 0,
+        packet_drop_prob: float = 0.0,
+        # ---------- estimator ----------
+        estimator_enabled: bool = False,
+        estimator_alpha: float = 0.25,
+        estimator_dt_hint: float = 1.0 / 48.0,
+        rng_seed: Optional[int] = None,
     ):
         self.client = int(pyb_client_id)
         self.drone_id = int(drone_id)
@@ -122,8 +179,52 @@ class SensorSuite:
         self.ray_blocker_ids: Set[int] = set()
         self.los_blocker_ids: Set[int] = set()
 
+        # uncertainty config
+        self.state_noise_std_pos = _as_vec3(state_noise_std_pos, 0.0)
+        self.state_noise_std_rpy = _as_vec3(state_noise_std_rpy, 0.0)
+        self.state_noise_std_vel = _as_vec3(state_noise_std_vel, 0.0)
+        self.state_noise_std_ang_vel = _as_vec3(state_noise_std_ang_vel, 0.0)
+
+        self.state_bias_pos = _as_vec3(state_bias_pos, 0.0)
+        self.state_bias_rpy = _as_vec3(state_bias_rpy, 0.0)
+        self.state_bias_vel = _as_vec3(state_bias_vel, 0.0)
+        self.state_bias_ang_vel = _as_vec3(state_bias_ang_vel, 0.0)
+
+        self.ray_noise_std = float(max(0.0, ray_noise_std))
+        self.ray_bias = float(ray_bias)
+        self.ray_dropout_prob = float(np.clip(ray_dropout_prob, 0.0, 1.0))
+
+        self.target_false_negative_prob = float(np.clip(target_false_negative_prob, 0.0, 1.0))
+        self.target_false_positive_prob = float(np.clip(target_false_positive_prob, 0.0, 1.0))
+        self.target_pos_noise_std = _as_vec3(target_pos_noise_std, 0.0)
+        self.target_pos_bias = _as_vec3(target_pos_bias, 0.0)
+
+        self.measurement_delay_steps = int(max(0, measurement_delay_steps))
+        self.packet_drop_prob = float(np.clip(packet_drop_prob, 0.0, 1.0))
+
+        self.estimator_enabled = bool(estimator_enabled)
+        self.estimator_alpha = float(np.clip(estimator_alpha, 1e-4, 1.0))
+        self.estimator_dt_hint = float(max(1e-6, estimator_dt_hint))
+
+        self.rng = np.random.default_rng(rng_seed)
+
         if arena_handle is not None:
             self.update_arena_handle(arena_handle)
+
+        self.reset_runtime_state()
+
+    def reset_runtime_state(self) -> None:
+        self._delay_buffer: Deque[Dict[str, Any]] = deque()
+        self._last_output_packet: Optional[Dict[str, Any]] = None
+        self._last_step: Optional[int] = None
+        self._last_t: Optional[float] = None
+
+        self._est_initialized = False
+        self._est_pos = np.zeros(3, dtype=float)
+        self._est_vel = np.zeros(3, dtype=float)
+        self._est_rpy = np.zeros(3, dtype=float)
+        self._est_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+        self._prev_meas_vel: Optional[np.ndarray] = None
 
     def update_arena_handle(self, arena_handle: Any) -> None:
         """
@@ -157,19 +258,44 @@ class SensorSuite:
         self.los_blocker_ids = {int(x) for x in getter("los_blocker_ids", list(default_blockers))}
 
     def sense(self, obs: Optional[np.ndarray] = None, step: Optional[int] = None, t: Optional[float] = None) -> Dict[str, Any]:
-        state = self._read_state(obs)
-        rays = self._sense_rays(state)
+        dt = self._infer_dt(step=step, t=t)
+
+        state_true = self._read_state(obs)
+        state_meas = self._apply_state_uncertainty(state_true)
+
+        rays_true = self._sense_rays(state_true)
+        rays = self._apply_ray_uncertainty(rays_true)
+
         collision = self._sense_collision()
-        targets_gt, targets_detected = self._sense_targets(state)
+        targets_gt, targets_detected = self._sense_targets(state_true)
+        targets_detected = self._apply_target_detection_uncertainty(targets_gt, targets_detected)
+
+        est = self._update_pose_estimate(state_meas, dt=dt)
 
         packet: Dict[str, Any] = {
             "step": step,
             "t": t,
-            "pos": state.pos,
-            "quat": state.quat,
-            "rpy": state.rpy,
-            "vel": state.vel,
-            "ang_vel": state.ang_vel,
+            "dt": dt,
+            # measured state
+            "pos": state_meas.pos,
+            "quat": state_meas.quat,
+            "rpy": state_meas.rpy,
+            "vel": state_meas.vel,
+            "ang_vel": state_meas.ang_vel,
+            # ground truth (for debugging / ablation)
+            "pos_gt": state_true.pos,
+            "quat_gt": state_true.quat,
+            "rpy_gt": state_true.rpy,
+            "vel_gt": state_true.vel,
+            "ang_vel_gt": state_true.ang_vel,
+            # estimator output
+            "pos_est": est["pos_est"],
+            "quat_est": est["quat_est"],
+            "rpy_est": est["rpy_est"],
+            "vel_est": est["vel_est"],
+            "estimator_enabled": self.estimator_enabled,
+            "estimator_initialized": est["initialized"],
+            # obstacle sensing
             "ray_dists": rays["ray_dists"],
             "ray_dirs_body": self.ray_dirs_body.copy(),
             "ray_hit_ids": rays["ray_hit_ids"],
@@ -179,32 +305,236 @@ class SensorSuite:
             "collision": bool(collision["collision"]),
             "contact_body_ids": collision["contact_body_ids"],
             "closest_obstacle_dist": float(collision["closest_obstacle_dist"]),
+            # targets
             "targets_gt": targets_gt,
             "targets_detected": targets_detected,
-            "detected_target_ids": [item["target_id"] for item in targets_detected],
+            "detected_target_ids": [int(item["target_id"]) for item in targets_detected],
+            # uncertainty meta
+            "packet_dropped": False,
+            "packet_stale": False,
+            "delay_buffer_size": 0,
+            "measurement_delay_steps": self.measurement_delay_steps,
+            "packet_drop_prob": self.packet_drop_prob,
         }
 
         if self.enable_debug_rays:
             self._draw_debug_rays(rays["ray_from"], rays["ray_to"], rays["ray_dists"])
 
-        return packet
+        return self._emit_with_delay_and_dropout(packet)
 
     def sense_obstacles(self, obs: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """
-        Lightweight obstacle-only interface for planners.
+        Lightweight interface for planners.
+        Note: implemented via `sense()` to keep uncertainty/delay/loss behavior consistent.
         """
-        state = self._read_state(obs)
-        rays = self._sense_rays(state)
-        collision = self._sense_collision()
+        pkt = self.sense(obs=obs, step=None, t=None)
         return {
-            "ray_dists": rays["ray_dists"],
-            "ray_dirs_body": self.ray_dirs_body.copy(),
-            "ray_hit_ids": rays["ray_hit_ids"],
-            "min_dist": float(rays["min_dist"]),
-            "min_dir_body": rays["min_dir_body"],
-            "collision": bool(collision["collision"]),
-            "contact_body_ids": collision["contact_body_ids"],
-            "closest_obstacle_dist": float(collision["closest_obstacle_dist"]),
+            "ray_dists": pkt["ray_dists"],
+            "ray_dirs_body": pkt["ray_dirs_body"],
+            "ray_hit_ids": pkt["ray_hit_ids"],
+            "min_dist": float(pkt["min_dist"]),
+            "min_dir_body": pkt["min_dir_body"],
+            "collision": bool(pkt["collision"]),
+            "contact_body_ids": pkt["contact_body_ids"],
+            "closest_obstacle_dist": float(pkt["closest_obstacle_dist"]),
+            "packet_dropped": bool(pkt["packet_dropped"]),
+            "packet_stale": bool(pkt["packet_stale"]),
+            "pos_est": pkt["pos_est"],
+            "quat_est": pkt["quat_est"],
+        }
+
+    def _infer_dt(self, step: Optional[int], t: Optional[float]) -> float:
+        dt = self.estimator_dt_hint
+        if t is not None and self._last_t is not None:
+            dt = max(0.0, float(t) - float(self._last_t))
+        elif step is not None and self._last_step is not None:
+            dt = max(0.0, float(step - self._last_step) * self.estimator_dt_hint)
+
+        if t is not None:
+            self._last_t = float(t)
+        if step is not None:
+            self._last_step = int(step)
+        return float(max(1e-6, dt))
+
+    def _emit_with_delay_and_dropout(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        # packet drop: hold-last-sample
+        dropped = bool(self.rng.random() < self.packet_drop_prob)
+        if dropped and self._last_output_packet is not None:
+            out = _clone_obj(self._last_output_packet)
+            out["packet_dropped"] = True
+            out["packet_stale"] = True
+            out["delay_buffer_size"] = len(self._delay_buffer)
+            return out
+
+        self._delay_buffer.append(_clone_obj(packet))
+
+        # delay model
+        if self.measurement_delay_steps <= 0:
+            out = self._delay_buffer.popleft()
+            stale = False
+        elif len(self._delay_buffer) > self.measurement_delay_steps:
+            out = self._delay_buffer.popleft()
+            stale = False
+        else:
+            # warm-up stage: not enough history yet, output oldest available
+            out = _clone_obj(self._delay_buffer[0])
+            stale = True
+
+        out["packet_dropped"] = False
+        out["packet_stale"] = bool(stale)
+        out["delay_buffer_size"] = len(self._delay_buffer)
+
+        self._last_output_packet = _clone_obj(out)
+        return out
+
+    def _apply_state_uncertainty(self, state: SelfState) -> SelfState:
+        pos = state.pos + self.state_bias_pos + self.rng.normal(0.0, self.state_noise_std_pos, size=3)
+        vel = state.vel + self.state_bias_vel + self.rng.normal(0.0, self.state_noise_std_vel, size=3)
+        ang_vel = state.ang_vel + self.state_bias_ang_vel + self.rng.normal(0.0, self.state_noise_std_ang_vel, size=3)
+
+        rpy = state.rpy + self.state_bias_rpy + self.rng.normal(0.0, self.state_noise_std_rpy, size=3)
+        rpy = _wrap_to_pi(rpy)
+        quat = np.asarray(p.getQuaternionFromEuler(rpy.tolist()), dtype=float)
+
+        return SelfState(
+            pos=np.asarray(pos, dtype=float),
+            quat=np.asarray(quat, dtype=float),
+            rpy=np.asarray(rpy, dtype=float),
+            vel=np.asarray(vel, dtype=float),
+            ang_vel=np.asarray(ang_vel, dtype=float),
+        )
+
+    def _apply_ray_uncertainty(self, rays: Dict[str, Any]) -> Dict[str, Any]:
+        dists = np.asarray(rays["ray_dists"], dtype=float).copy()
+        hit_ids = np.asarray(rays["ray_hit_ids"], dtype=int).copy()
+        hit_points = np.asarray(rays["ray_hit_points"], dtype=float).copy()
+        ray_from = np.asarray(rays["ray_from"], dtype=float).copy()
+        ray_to = np.asarray(rays["ray_to"], dtype=float).copy()
+
+        if self.ray_noise_std > 0.0 or abs(self.ray_bias) > 1e-12:
+            dists = dists + self.ray_bias + self.rng.normal(0.0, self.ray_noise_std, size=dists.shape)
+
+        if self.ray_dropout_prob > 0.0:
+            mask = self.rng.random(size=dists.shape) < self.ray_dropout_prob
+            dists[mask] = self.ray_length
+            hit_ids[mask] = -1
+            hit_points[mask] = ray_to[mask]
+
+        dists = np.clip(dists, 0.0, self.ray_length)
+
+        if dists.size > 0:
+            min_i = int(np.argmin(dists))
+            min_dist = float(dists[min_i])
+            min_dir_body = self.ray_dirs_body[min_i].copy()
+        else:
+            min_dist = float("inf")
+            min_dir_body = np.zeros(3, dtype=float)
+
+        return {
+            "ray_dists": dists,
+            "ray_hit_ids": hit_ids,
+            "ray_hit_points": hit_points,
+            "min_dist": min_dist,
+            "min_dir_body": min_dir_body,
+            "ray_from": ray_from,
+            "ray_to": ray_to,
+        }
+
+    def _apply_target_detection_uncertainty(
+        self,
+        targets_gt: List[Dict[str, Any]],
+        targets_detected: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        detected_by_id = {int(item["target_id"]): item for item in targets_detected}
+        out: List[Dict[str, Any]] = []
+
+        for gt_item in targets_gt:
+            tid = int(gt_item["target_id"])
+            was_visible = tid in detected_by_id
+            visible = was_visible
+
+            # false negative
+            if visible and self.target_false_negative_prob > 0.0:
+                if self.rng.random() < self.target_false_negative_prob:
+                    visible = False
+
+            # false positive (promote non-visible target to visible)
+            if (not visible) and self.target_false_positive_prob > 0.0:
+                if self.rng.random() < self.target_false_positive_prob:
+                    visible = True
+
+            if not visible:
+                continue
+
+            base_item = detected_by_id.get(tid, gt_item)
+            item = dict(base_item)
+            item["visible"] = True
+            item["visible_fp"] = bool(not was_visible and tid not in detected_by_id)
+
+            src = str(item.get("source", ""))
+            if item["visible_fp"]:
+                item["source"] = f"{src}+fp" if src else "fp"
+
+            pos_true = np.asarray(item["position"], dtype=float)
+            pos_meas = pos_true + self.target_pos_bias + self.rng.normal(0.0, self.target_pos_noise_std, size=3)
+            item["position_measured"] = np.asarray(pos_meas, dtype=float)
+
+            out.append(item)
+
+        return out
+
+    def _update_pose_estimate(self, state_meas: SelfState, dt: float) -> Dict[str, Any]:
+        if not self.estimator_enabled:
+            return {
+                "pos_est": state_meas.pos.copy(),
+                "quat_est": state_meas.quat.copy(),
+                "rpy_est": state_meas.rpy.copy(),
+                "vel_est": state_meas.vel.copy(),
+                "initialized": True,
+            }
+
+        if not self._est_initialized:
+            self._est_pos = state_meas.pos.copy()
+            self._est_vel = state_meas.vel.copy()
+            self._est_rpy = state_meas.rpy.copy()
+            self._est_quat = state_meas.quat.copy()
+            self._prev_meas_vel = state_meas.vel.copy()
+            self._est_initialized = True
+            return {
+                "pos_est": self._est_pos.copy(),
+                "quat_est": self._est_quat.copy(),
+                "rpy_est": self._est_rpy.copy(),
+                "vel_est": self._est_vel.copy(),
+                "initialized": True,
+            }
+
+        dt = float(max(1e-6, dt))
+        alpha = self.estimator_alpha
+
+        if self._prev_meas_vel is None:
+            acc_meas = np.zeros(3, dtype=float)
+        else:
+            acc_meas = (state_meas.vel - self._prev_meas_vel) / dt
+
+        # Dead-reckoning prediction
+        pred_vel = self._est_vel + acc_meas * dt
+        pred_pos = self._est_pos + self._est_vel * dt + 0.5 * acc_meas * (dt ** 2)
+        pred_rpy = self._est_rpy
+
+        # Complementary-style correction
+        self._est_vel = (1.0 - alpha) * pred_vel + alpha * state_meas.vel
+        self._est_pos = (1.0 - alpha) * pred_pos + alpha * state_meas.pos
+        self._est_rpy = _wrap_to_pi((1.0 - alpha) * pred_rpy + alpha * state_meas.rpy)
+        self._est_quat = np.asarray(p.getQuaternionFromEuler(self._est_rpy.tolist()), dtype=float)
+
+        self._prev_meas_vel = state_meas.vel.copy()
+
+        return {
+            "pos_est": self._est_pos.copy(),
+            "quat_est": self._est_quat.copy(),
+            "rpy_est": self._est_rpy.copy(),
+            "vel_est": self._est_vel.copy(),
+            "initialized": True,
         }
 
     def _read_state(self, obs: Optional[np.ndarray]) -> SelfState:
@@ -359,7 +689,7 @@ class SensorSuite:
                 source = "hybrid"
 
             info = {
-                "target_id": tid,
+                "target_id": int(tid),
                 "position": tpos,
                 "distance": dist,
                 "bearing_body": vec_b,
@@ -374,7 +704,7 @@ class SensorSuite:
             }
             targets_gt.append(info)
             if visible:
-                targets_detected.append(info)
+                targets_detected.append(dict(info))
 
         return targets_gt, targets_detected
 
