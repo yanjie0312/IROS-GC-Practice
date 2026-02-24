@@ -62,13 +62,16 @@ def main():
         # 传感器感知
         pkt = sensor.sense(obs=obs[0], step=i, t=t)
 
-        # 每秒打印一次感知数据
-        if i % CFG["control_freq_hz"] == 0:
-            print(f"[t={t:5.1f}s] "
-                  f"pos=({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {pkt['pos'][2]:.2f}) "
-                  f"min_dist={pkt['min_dist']:.2f} "
-                  f"collision={pkt['collision']} "
-                  f"targets={pkt['detected_target_ids']}")
+        # 每 5 秒打印一次全部射线数据
+        if i % (CFG["control_freq_hz"] * 5) == 0:
+            print(f"\n[t={t:5.1f}s] pos=({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {pkt['pos'][2]:.2f})")
+            print(f"  {'射线':>4s}  {'方向 (x, y, z)':>22s}  {'距离':>6s}")
+            print(f"  {'----':>4s}  {'---------------':>22s}  {'----':>6s}")
+            for j in range(len(pkt["ray_dists"])):
+                d = pkt["ray_dirs_body"][j]
+                dist = pkt["ray_dists"][j]
+                label = "水平" if j < 16 else "倾斜"
+                print(f"  [{j:2d}]  ({d[0]:+.2f}, {d[1]:+.2f}, {d[2]:+.2f})  {dist:5.2f}m  {label}")
 
         # PID 控制
         action[0, :] = pid.compute(
