@@ -1,23 +1,6 @@
 # my_project/env/build_arena.py
 # -*- coding: utf-8 -*-
-"""
-build_arena.py（真实户型风格：墙段 segments + 门洞 gaps + 随机障碍/目标）
 
-你要的目标：
-- easy：两室一厅（apt_2room1hall）
-- med ：三室两厅（apt_3room2hall）
-- 不改 sensors，不改接口：create_arena(scenario) 返回 arena_handle（body id 列表）
-
-arena_handle 格式（保持不变）：
-arena_handle = {
-    "wall_ids": [...],
-    "obstacle_ids": [...],
-    "nofly_ids": [...],
-    "target_ids": [...],
-    "ray_blocker_ids": [...],  # 默认=墙+障碍+nofly
-    "los_blocker_ids": [...],  # 默认=墙+障碍+nofly
-}
-"""
 
 from __future__ import annotations
 from typing import Dict, List, Tuple, Optional
@@ -533,3 +516,37 @@ def create_arena(scenario, client_id: Optional[int] = None) -> Dict[str, List[in
         "los_blocker_ids": los_blocker_ids,
     }
     return arena_handle
+
+
+# ============================================================
+# 5) 兼容接口：简单四面墙（供 main.py 使用）
+# ============================================================
+def create_four_walls(
+    pyb_client_id: int,
+    half_size: float = 1.5,
+    wall_thickness: float = 0.005,
+    wall_height: float = 0.8,
+) -> List[int]:
+    """
+    创建以原点为中心的正方形四面墙，返回墙体 body ID 列表。
+    """
+    cid = int(pyb_client_id)
+    s = float(half_size)
+    t = float(wall_thickness)
+    h = float(wall_height)
+
+    segments = [
+        (-s, -s, +s, -s),  # 下墙
+        (-s, +s, +s, +s),  # 上墙
+        (-s, -s, -s, +s),  # 左墙
+        (+s, -s, +s, +s),  # 右墙
+    ]
+
+    ids: List[int] = []
+    for x1, y1, x2, y2 in segments:
+        wid = _create_wall_segment(x1, y1, x2, y2,
+                                   thickness=t, height=h,
+                                   rgba=(0.70, 0.70, 0.70, 1.0),
+                                   client_id=cid)
+        ids.append(wid)
+    return ids

@@ -7,7 +7,7 @@ CFG = {
     "physics": Physics("pyb"),
     "gui": True,
     "record_video": False,
-    "plot": True,
+    "plot": False,
     "user_debug_gui": False,
 
     "simulation_freq_hz": 240,

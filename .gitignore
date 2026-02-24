@@ -434,5 +434,5 @@ TSWLatexianTemp*
 # Uncomment the next line to have this generated file ignored.
 #*Notes.bib
 
-!gym_pybullet_drones/examples/my_project/env/
-!gym_pybullet_drones/examples/my_project/env/**
+!my_project/env/
+!my_project/env/**
