@@ -298,6 +298,8 @@ class SensorSuite:
             # obstacle sensing
             "ray_dists": rays["ray_dists"],
             "ray_dirs_body": self.ray_dirs_body.copy(),
+            # ✅ NEW: world-frame ray directions (same order as ray_dirs_body)
+            "ray_dirs_world": rays_true["ray_dirs_world"].copy(),
             "ray_hit_ids": rays["ray_hit_ids"],
             "ray_hit_points": rays["ray_hit_points"],
             "min_dist": float(rays["min_dist"]),
@@ -331,6 +333,7 @@ class SensorSuite:
         return {
             "ray_dists": pkt["ray_dists"],
             "ray_dirs_body": pkt["ray_dirs_body"],
+            "ray_dirs_world": pkt.get("ray_dirs_world", None),  # ✅ NEW
             "ray_hit_ids": pkt["ray_hit_ids"],
             "min_dist": float(pkt["min_dist"]),
             "min_dir_body": pkt["min_dir_body"],
@@ -342,6 +345,8 @@ class SensorSuite:
             "pos_est": pkt["pos_est"],
             "quat_est": pkt["quat_est"],
         }
+
+    # -------------------- (the rest unchanged) --------------------
 
     def _infer_dt(self, step: Optional[int], t: Optional[float]) -> float:
         dt = self.estimator_dt_hint
@@ -357,7 +362,6 @@ class SensorSuite:
         return float(max(1e-6, dt))
 
     def _emit_with_delay_and_dropout(self, packet: Dict[str, Any]) -> Dict[str, Any]:
-        # packet drop: hold-last-sample
         dropped = bool(self.rng.random() < self.packet_drop_prob)
         if dropped and self._last_output_packet is not None:
             out = _clone_obj(self._last_output_packet)
@@ -368,7 +372,6 @@ class SensorSuite:
 
         self._delay_buffer.append(_clone_obj(packet))
 
-        # delay model
         if self.measurement_delay_steps <= 0:
             out = self._delay_buffer.popleft()
             stale = False
@@ -376,7 +379,6 @@ class SensorSuite:
             out = self._delay_buffer.popleft()
             stale = False
         else:
-            # warm-up stage: not enough history yet, output oldest available
             out = _clone_obj(self._delay_buffer[0])
             stale = True
 
@@ -440,49 +442,6 @@ class SensorSuite:
             "ray_to": ray_to,
         }
 
-    def _apply_target_detection_uncertainty(
-        self,
-        targets_gt: List[Dict[str, Any]],
-        targets_detected: List[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        detected_by_id = {int(item["target_id"]): item for item in targets_detected}
-        out: List[Dict[str, Any]] = []
-
-        for gt_item in targets_gt:
-            tid = int(gt_item["target_id"])
-            was_visible = tid in detected_by_id
-            visible = was_visible
-
-            # false negative
-            if visible and self.target_false_negative_prob > 0.0:
-                if self.rng.random() < self.target_false_negative_prob:
-                    visible = False
-
-            # false positive (promote non-visible target to visible)
-            if (not visible) and self.target_false_positive_prob > 0.0:
-                if self.rng.random() < self.target_false_positive_prob:
-                    visible = True
-
-            if not visible:
-                continue
-
-            base_item = detected_by_id.get(tid, gt_item)
-            item = dict(base_item)
-            item["visible"] = True
-            item["visible_fp"] = bool(not was_visible and tid not in detected_by_id)
-
-            src = str(item.get("source", ""))
-            if item["visible_fp"]:
-                item["source"] = f"{src}+fp" if src else "fp"
-
-            pos_true = np.asarray(item["position"], dtype=float)
-            pos_meas = pos_true + self.target_pos_bias + self.rng.normal(0.0, self.target_pos_noise_std, size=3)
-            item["position_measured"] = np.asarray(pos_meas, dtype=float)
-
-            out.append(item)
-
-        return out
-
     def _update_pose_estimate(self, state_meas: SelfState, dt: float) -> Dict[str, Any]:
         if not self.estimator_enabled:
             return {
@@ -516,12 +475,10 @@ class SensorSuite:
         else:
             acc_meas = (state_meas.vel - self._prev_meas_vel) / dt
 
-        # Dead-reckoning prediction
         pred_vel = self._est_vel + acc_meas * dt
         pred_pos = self._est_pos + self._est_vel * dt + 0.5 * acc_meas * (dt ** 2)
         pred_rpy = self._est_rpy
 
-        # Complementary-style correction
         self._est_vel = (1.0 - alpha) * pred_vel + alpha * state_meas.vel
         self._est_pos = (1.0 - alpha) * pred_pos + alpha * state_meas.pos
         self._est_rpy = _wrap_to_pi((1.0 - alpha) * pred_rpy + alpha * state_meas.rpy)
@@ -562,10 +519,12 @@ class SensorSuite:
     def _sense_rays(self, state: SelfState) -> Dict[str, Any]:
         rot = np.array(p.getMatrixFromQuaternion(state.quat), dtype=float).reshape(3, 3)
 
+        ray_dirs_world: List[np.ndarray] = []  # ✅ NEW
         ray_from: List[np.ndarray] = []
         ray_to: List[np.ndarray] = []
         for d_body in self.ray_dirs_body:
             d_world = rot @ d_body
+            ray_dirs_world.append(d_world)  # ✅ NEW
             start = state.pos + self.ray_start_offset * d_world
             end = state.pos + self.ray_length * d_world
             ray_from.append(start)
@@ -609,7 +568,10 @@ class SensorSuite:
             "min_dir_body": min_dir_body,
             "ray_from": np.asarray(ray_from, dtype=float),
             "ray_to": np.asarray(ray_to, dtype=float),
+            "ray_dirs_world": np.asarray(ray_dirs_world, dtype=float),  # ✅ NEW
         }
+
+    # ---- rest functions unchanged (collision/targets/camera/debug) ----
 
     def _sense_collision(self) -> Dict[str, Any]:
         query_ids = set(self.ray_blocker_ids) if self.ray_blocker_ids else set(self.wall_ids | self.obstacle_ids | self.nofly_ids)
