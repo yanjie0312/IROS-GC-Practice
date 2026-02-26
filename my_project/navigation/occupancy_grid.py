@@ -88,9 +88,14 @@ class OccupancyGrid:
 
         # Keep the current drone cell observable even when ray data is unavailable.
         self._mark_free_world(origin_xy)
-        # Handle empty-ray case explicitly, regardless of provided dimensionality.
+        # Empty update is allowed only when both arrays are empty.
         if dirs.size == 0:
-            return
+            if dists.size == 0:
+                return
+            raise ValueError(
+                "ray_dirs_world is empty while ray_dists is non-empty; "
+                f"got {dists.shape[0]} distances"
+            )
         # Allow a single direction given as a 1D vector of length 2 or 3.
         if dirs.ndim == 1:
             if dirs.size in (2, 3):

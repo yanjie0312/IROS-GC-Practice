@@ -63,21 +63,13 @@ class FrontierPlanner:
 
         frontier_cells = self.grid.get_frontier_indices()
         if not frontier_cells:
-            self._clusters = []
-            self._cluster_centers = []
-            self._cluster_representatives = []
-            self._no_frontier_steps += 1
-            self._done = self._no_frontier_steps >= self.done_frontier_streak
+            self._handle_no_frontiers()
             return
 
         clusters = self._cluster_frontiers(frontier_cells)
         clusters = [c for c in clusters if len(c) >= self.min_cluster_size]
         if not clusters:
-            self._clusters = []
-            self._cluster_centers = []
-            self._cluster_representatives = []
-            self._no_frontier_steps += 1
-            self._done = self._no_frontier_steps >= self.done_frontier_streak
+            self._handle_no_frontiers()
             return
 
         self._clusters = clusters
@@ -117,6 +109,13 @@ class FrontierPlanner:
 
     def get_frontier_centers(self) -> List[np.ndarray]:
         return [c.copy() for c in self._cluster_centers]
+
+    def _handle_no_frontiers(self) -> None:
+        self._clusters = []
+        self._cluster_centers = []
+        self._cluster_representatives = []
+        self._no_frontier_steps += 1
+        self._done = self._no_frontier_steps >= self.done_frontier_streak
 
     def _cluster_frontiers(self, frontier_cells: List[Tuple[int, int]]) -> List[List[Tuple[int, int]]]:
         cell_set = set(frontier_cells)
