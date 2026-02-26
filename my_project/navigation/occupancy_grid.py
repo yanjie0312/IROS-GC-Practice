@@ -97,7 +97,13 @@ class OccupancyGrid:
         else:
             raise ValueError("ray_dirs_world must have shape (N,2) or (N,3)")
 
-        n = min(dists.shape[0], dirs_xy.shape[0])
+        if dists.shape[0] != dirs_xy.shape[0]:
+            raise ValueError(
+                f"ray_dists and ray_dirs_world must have the same length; "
+                f"got {dists.shape[0]} distances and {dirs_xy.shape[0]} directions"
+            )
+
+        n = dists.shape[0]
         for i in range(n):
             dist = float(dists[i])
             if not np.isfinite(dist):
