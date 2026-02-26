@@ -95,3 +95,54 @@ def test_frontier_planner_done_after_no_frontier_streak():
 
     planner.update(drone_pos=drone, ray_dists=empty_dists, ray_dirs_world=empty_dirs)
     assert planner.is_exploration_done()
+
+
+def test_occupancy_grid_rejects_mismatched_lengths():
+    grid = OccupancyGrid(
+        resolution=0.1,
+        bounds=GridBounds(x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0),
+        ray_length=1.0,
+    )
+    drone = np.array([0.0, 0.0, 1.0], dtype=float)
+    ray_dists = np.array([0.3, 0.4], dtype=float)
+    ray_dirs_world = np.array([[1.0, 0.0, 0.0]], dtype=float)
+
+    try:
+        grid.update(drone_pos=drone, ray_dists=ray_dists, ray_dirs_world=ray_dirs_world)
+    except ValueError as e:
+        assert "same length" in str(e)
+    else:
+        raise AssertionError("Expected ValueError for mismatched ray lengths")
+
+
+def test_occupancy_grid_rejects_empty_dirs_with_nonempty_dists():
+    grid = OccupancyGrid(
+        resolution=0.1,
+        bounds=GridBounds(x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0),
+        ray_length=1.0,
+    )
+    drone = np.array([0.0, 0.0, 1.0], dtype=float)
+    ray_dists = np.array([0.3], dtype=float)
+    ray_dirs_world = np.array([], dtype=float)
+
+    try:
+        grid.update(drone_pos=drone, ray_dists=ray_dists, ray_dirs_world=ray_dirs_world)
+    except ValueError as e:
+        assert "empty while ray_dists is non-empty" in str(e)
+    else:
+        raise AssertionError("Expected ValueError for empty directions with non-empty distances")
+
+
+def test_occupancy_grid_accepts_single_1d_direction():
+    grid = OccupancyGrid(
+        resolution=0.1,
+        bounds=GridBounds(x_min=-1.0, x_max=1.0, y_min=-1.0, y_max=1.0),
+        ray_length=1.0,
+        hit_epsilon=0.02,
+    )
+    drone = np.array([0.0, 0.0, 1.0], dtype=float)
+    ray_dists = np.array([0.4], dtype=float)
+    ray_dirs_world = np.array([1.0, 0.0, 0.0], dtype=float)  # shape (3,)
+
+    grid.update(drone_pos=drone, ray_dists=ray_dists, ray_dirs_world=ray_dirs_world)
+    assert _cell_state(grid, 0.4, 0.0) == OCCUPIED
