@@ -88,8 +88,24 @@ class OccupancyGrid:
 
         # Keep the current drone cell observable even when ray data is unavailable.
         self._mark_free_world(origin_xy)
-        if dirs.ndim != 2 or dirs.shape[0] == 0:
+        # Handle empty-ray case explicitly, regardless of provided dimensionality.
+        if dirs.size == 0:
             return
+        # Allow a single direction given as a 1D vector of length 2 or 3.
+        if dirs.ndim == 1:
+            if dirs.size in (2, 3):
+                dirs = dirs.reshape(1, -1)
+            else:
+                raise ValueError(
+                    "ray_dirs_world 1D input must have length 2 or 3; "
+                    f"got shape {dirs.shape}"
+                )
+        # At this point, only 2D inputs are allowed.
+        if dirs.ndim != 2:
+            raise ValueError(
+                "ray_dirs_world must be a 2D array with shape (N,2) or (N,3); "
+                f"got array with ndim={dirs.ndim} and shape={dirs.shape}"
+            )
         if dirs.shape[1] == 2:
             dirs_xy = dirs
         elif dirs.shape[1] >= 3:
