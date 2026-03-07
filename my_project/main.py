@@ -85,9 +85,10 @@ def main():
     manager = MissionManager(
         mission=mission,
         avoidance_layer=AvoidanceLayer(
-            d0=1.5,    # 1.5m 内开始产生排斥力（默认 1.0m，距离太短来不及反应）
-            k_rep=1.2, # 排斥力系数略微增强
-            alpha=0.7, # 70% 权重给安全方向，更保守（默认 0.5）
+            d0=0.4,    # 只在 0.4m 内才产生排斥力，不干扰正常巡航
+            k_rep=0.5, # 排斥力系数保持温和
+            alpha=0.3, # 仅 30% 权重给安全方向，主要信任 frontier 航点
+            min_dist_emergency=0.15,  # 紧急情况（<0.15m）自动放大排斥力
         ),
     )
 
@@ -127,6 +128,16 @@ def main():
                 f"[t={t:6.1f}s] pos=({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {pkt['pos'][2]:.2f})"
                 f"  目标：{inspected}/{total} 巡检完, {discovered}/{total} 已发现"
             )
+
+        # 坠毁检测：高度过低 或 姿态严重倾斜（翻转）
+        z = float(pkt["pos"][2])
+        roll, pitch = float(pkt["rpy"][0]), float(pkt["rpy"][1])
+        crashed = z < 0.08 or abs(roll) > 1.0 or abs(pitch) > 1.0  # 1.0 rad ≈ 57°
+        if crashed and i > env.CTRL_FREQ:  # 跳过最初 1 秒的起飞抖动
+            inspected, discovered, total = target_manager.get_progress()
+            print(f"\n=== 无人机坠毁！t={t:.1f}s  pos=({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {z:.2f})  rpy=({np.degrees(roll):.1f}°, {np.degrees(pitch):.1f}°) ===")
+            print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
+            break
 
         # 任务完成
         if cmd.finished:

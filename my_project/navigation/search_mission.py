@@ -8,6 +8,7 @@ import numpy as np
 
 from .base import BaseMission, Command, State
 from .frontier_planner import FrontierPlanner
+from .occupancy_grid import OCCUPIED
 from ..env.targets import TargetManager
 
 
@@ -216,12 +217,42 @@ class SearchMission(BaseMission):
             self.planner.update(pos, ray_dists, ray_dirs_world)
 
     def _pick_next_frontier(self, pos: np.ndarray) -> Optional[np.ndarray]:
-        """获取下一个 frontier 航点，并强制使用巡航高度。"""
+        """
+        获取下一个安全航点：
+        1. 从 FrontierPlanner 获取目标 frontier
+        2. 沿目标方向逐步检查占据栅格，在遇到 OCCUPIED 格之前停下
+        3. 这样保证航点始终在已知自由空间内，不穿越墙壁
+        """
         wp = self.planner.get_next_waypoint(pos)
-        if wp is not None:
-            wp = wp.copy()
-            wp[2] = self.takeoff_height
-        return wp
+        if wp is None:
+            return None
+
+        goal_xy = wp[:2]
+        pos_xy = pos[:2]
+        direction = goal_xy - pos_xy
+        dist = float(np.linalg.norm(direction))
+
+        if dist < 1e-6:
+            return np.array([pos_xy[0], pos_xy[1], self.takeoff_height], dtype=float)
+
+        unit = direction / dist
+        check_step = 0.1          # 每次检查步长（m）
+        max_step = min(dist, 1.5) # 单次最远前进距离（m）
+
+        safe_xy = pos_xy.copy()
+        d = check_step
+        while d <= max_step:
+            candidate = pos_xy + unit * d
+            # 只在确认是墙（OCCUPIED）时才停下，UNKNOWN 格可以穿越（探索目的）
+            idx = self.planner.grid.world_to_grid(candidate)
+            if idx is None:
+                break  # 超出栅格范围
+            if self.planner.grid.grid[idx[0], idx[1]] == OCCUPIED:
+                break  # 确认是墙，停在上一步
+            safe_xy = candidate
+            d += check_step
+
+        return np.array([safe_xy[0], safe_xy[1], self.takeoff_height], dtype=float)
 
     def _get_discovered_uninspected(self) -> Optional[Tuple[int, np.ndarray]]:
         """返回第一个已发现但未巡检的目标 (id, pos)，没有则返回 None。"""
