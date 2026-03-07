@@ -149,16 +149,26 @@ class SearchMission(BaseMission):
         return Command(target_pos=self._current_waypoint.copy(), target_rpy=rpy)
 
     def _handle_goto_target(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
-        tpos = self._current_target_pos
-        dist = float(np.linalg.norm(pos - tpos))
-        if dist < self.inspect_hover_dist:
+        # 在目标正上方巡航高度悬停，不跟随目标的地面 z 坐标
+        hover = np.array([
+            self._current_target_pos[0],
+            self._current_target_pos[1],
+            self.takeoff_height,
+        ], dtype=float)
+        dist_xy = float(np.linalg.norm(pos[:2] - hover[:2]))
+        if dist_xy < self.inspect_hover_dist:
             self._log(f"GOTO_TARGET: reached target {self._current_target_id} → INSPECT")
             self._phase = _Phase.INSPECT
-        return Command(target_pos=tpos.copy(), target_rpy=rpy)
+        return Command(target_pos=hover, target_rpy=rpy)
 
     def _handle_inspect(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
         tid = self._current_target_id
-        tpos = self._current_target_pos
+        # 在目标正上方巡航高度悬停等待计时
+        tpos = np.array([
+            self._current_target_pos[0],
+            self._current_target_pos[1],
+            self.takeoff_height,
+        ], dtype=float)
 
         # 检查当前目标是否巡检完成（TargetManager 在 main.py 的循环里计时）
         if tid is not None and self.target_manager.targets[tid].inspected:
@@ -166,14 +176,14 @@ class SearchMission(BaseMission):
             self._log(f"INSPECT done  ({inspected}/{total} targets inspected)")
 
             # 还有未巡检目标？
-            next_t = self.target_manager.get_nearest_unvisited(pos)
+            next_t = self.target_manager.get_nearest_discovered_uninspected(pos)
             if next_t is not None:
                 ntid, ntpos, _ = next_t
                 self._current_target_id = ntid
                 self._current_target_pos = ntpos
                 self._phase = _Phase.GOTO_TARGET
                 self._log(f"→ GOTO_TARGET {ntid}  pos={ntpos.round(2)}")
-                return Command(target_pos=ntpos.copy(), target_rpy=rpy)
+                return Command(target_pos=np.array([ntpos[0], ntpos[1], self.takeoff_height]), target_rpy=rpy)
 
             # 无目标：恢复探索或结束
             if not self.planner.is_exploration_done():
@@ -219,9 +229,8 @@ class SearchMission(BaseMission):
     def _pick_next_frontier(self, pos: np.ndarray) -> Optional[np.ndarray]:
         """
         获取下一个安全航点：
-        1. 从 FrontierPlanner 获取目标 frontier
-        2. 沿目标方向逐步检查占据栅格，在遇到 OCCUPIED 格之前停下
-        3. 这样保证航点始终在已知自由空间内，不穿越墙壁
+        沿朝向 frontier 的方向逐步检查占据栅格，
+        遇到 OCCUPIED 格才停下（UNKNOWN 格可穿越），返回最远安全点。
         """
         wp = self.planner.get_next_waypoint(pos)
         if wp is None:
@@ -236,19 +245,18 @@ class SearchMission(BaseMission):
             return np.array([pos_xy[0], pos_xy[1], self.takeoff_height], dtype=float)
 
         unit = direction / dist
-        check_step = 0.1          # 每次检查步长（m）
-        max_step = min(dist, 1.5) # 单次最远前进距离（m）
+        check_step = 0.1
+        max_step = min(dist, 1.5)
 
         safe_xy = pos_xy.copy()
         d = check_step
         while d <= max_step:
             candidate = pos_xy + unit * d
-            # 只在确认是墙（OCCUPIED）时才停下，UNKNOWN 格可以穿越（探索目的）
             idx = self.planner.grid.world_to_grid(candidate)
             if idx is None:
-                break  # 超出栅格范围
+                break
             if self.planner.grid.grid[idx[0], idx[1]] == OCCUPIED:
-                break  # 确认是墙，停在上一步
+                break
             safe_xy = candidate
             d += check_step
 
@@ -270,7 +278,7 @@ class SearchMission(BaseMission):
         - 无目标 → DONE，返回 Command
         - 仍有 frontier（不应发生）→ 返回 None（继续 EXPLORE）
         """
-        remaining = self.target_manager.get_nearest_unvisited(pos)
+        remaining = self.target_manager.get_nearest_discovered_uninspected(pos)
         if remaining is not None:
             tid, tpos, _ = remaining
             self._current_target_id = tid
