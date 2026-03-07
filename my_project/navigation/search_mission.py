@@ -48,8 +48,8 @@ class SearchMission(BaseMission):
         inspect_hover_dist: float = 0.4,
         frontier_replan_cooldown_steps: int = 10,
         min_waypoint_delta: float = 0.12,
-        target_retry_cooldown_steps: int = 40,
-        stuck_window_steps: int = 70,
+        target_retry_cooldown_steps: int = 120,
+        stuck_window_steps: int = 180,
         stuck_radius: float = 0.25,
         goto_path_lookahead_dist: float = 0.6,
         goto_goal_search_radius: float = 0.8,
@@ -162,6 +162,11 @@ class SearchMission(BaseMission):
                 self._log(f"EXPLORE: target {tid} discovered → GOTO_TARGET  pos={tpos.round(2)}")
                 return Command(target_pos=approach_wp, target_rpy=rpy)
             self._next_target_attempt_step = self._cur_step + self.target_retry_cooldown_steps
+            guided_wp = self._pick_frontier_towards(pos, tpos)
+            if guided_wp is not None and float(np.linalg.norm(guided_wp[:2] - self._current_waypoint[:2])) > 0.20:
+                self._current_waypoint = guided_wp
+                self._last_frontier_pick_step = self._cur_step
+                self._log(f"EXPLORE: guide toward target {tid} → {guided_wp.round(2)}")
 
         # 判断是否到达当前 frontier 航点（水平距离）
         dist_xy = float(np.linalg.norm(pos[:2] - self._current_waypoint[:2]))
@@ -172,7 +177,7 @@ class SearchMission(BaseMission):
             ):
                 return Command(target_pos=self._current_waypoint.copy(), target_rpy=rpy)
 
-            wp = self._pick_next_frontier(pos, prefer_far=force_replan)
+            wp = self._pick_next_frontier(pos)
             if wp is not None:
                 if force_replan or float(np.linalg.norm(wp[:2] - self._current_waypoint[:2])) >= self.min_waypoint_delta:
                     self._current_waypoint = wp
@@ -216,7 +221,9 @@ class SearchMission(BaseMission):
         self._phase = _Phase.EXPLORE
         self._next_target_attempt_step = self._cur_step + self.target_retry_cooldown_steps
         self._reset_stuck_anchor(pos)
-        wp = self._pick_next_frontier(pos, prefer_far=True)
+        wp = self._pick_frontier_towards(pos, self._current_target_pos)
+        if wp is None:
+            wp = self._pick_next_frontier(pos)
         if wp is not None:
             self._current_waypoint = wp
             self._last_frontier_pick_step = self._cur_step
@@ -250,10 +257,18 @@ class SearchMission(BaseMission):
                     self._log(f"→ GOTO_TARGET {ntid}  pos={ntpos.round(2)}")
                     return Command(target_pos=approach_wp, target_rpy=rpy)
                 self._next_target_attempt_step = self._cur_step + self.target_retry_cooldown_steps
+                wp = self._pick_frontier_towards(pos, ntpos)
+                if wp is not None:
+                    self._current_waypoint = wp
+                    self._last_frontier_pick_step = self._cur_step
+                    self._phase = _Phase.EXPLORE
+                    self._reset_stuck_anchor(pos)
+                    self._log(f"→ EXPLORE (guide to target {ntid})")
+                    return Command(target_pos=wp, target_rpy=rpy)
 
             # 无目标：恢复探索或结束
             if not self.planner.is_exploration_done():
-                wp = self._pick_next_frontier(pos, prefer_far=True)
+                wp = self._pick_next_frontier(pos)
                 if wp is not None:
                     self._current_waypoint = wp
                     self._last_frontier_pick_step = self._cur_step
@@ -294,30 +309,27 @@ class SearchMission(BaseMission):
         if ray_dists is not None and ray_dirs_world is not None:
             self.planner.update(pos, ray_dists, ray_dirs_world)
 
-    def _pick_next_frontier(self, pos: np.ndarray, prefer_far: bool = False) -> Optional[np.ndarray]:
+    def _pick_next_frontier(self, pos: np.ndarray) -> Optional[np.ndarray]:
         """
         获取下一个安全航点：
         沿朝向 frontier 的方向逐步检查占据栅格，
         遇到 OCCUPIED 格才停下（UNKNOWN 格可穿越），返回最远安全点。
         """
-        if prefer_far:
-            centers = self.planner.get_frontier_centers()
-            if centers:
-                dists = np.asarray([float(np.linalg.norm(c[:2] - pos[:2])) for c in centers], dtype=float)
-                for idx in np.argsort(-dists):
-                    safe = self._clip_waypoint_to_safe(pos, centers[int(idx)][:2])
-                    if float(np.linalg.norm(safe[:2] - pos[:2])) > 0.25:
-                        return safe
+        inspected, discovered, _ = self.target_manager.get_progress()
+        if discovered == 0 and inspected == 0:
+            biased = self._pick_rightward_frontier(pos)
+            if biased is not None:
+                return biased
 
         wp = self.planner.get_next_waypoint(pos)
         if wp is None:
             return None
         safe = self._clip_waypoint_to_safe(pos, wp[:2])
-        if float(np.linalg.norm(safe[:2] - pos[:2])) < 0.12 and not prefer_far:
+        if float(np.linalg.norm(safe[:2] - pos[:2])) < 0.12:
             centers = self.planner.get_frontier_centers()
             if centers:
                 dists = np.asarray([float(np.linalg.norm(c[:2] - pos[:2])) for c in centers], dtype=float)
-                for idx in np.argsort(-dists):
+                for idx in np.argsort(dists):
                     alt = self._clip_waypoint_to_safe(pos, centers[int(idx)][:2])
                     if float(np.linalg.norm(alt[:2] - pos[:2])) > 0.20:
                         return alt
@@ -371,6 +383,70 @@ class SearchMission(BaseMission):
         if wp.size < 2:
             return None
         return np.array([wp[0], wp[1], self.takeoff_height], dtype=float)
+
+    def _pick_frontier_towards(self, pos: np.ndarray, goal_pos: np.ndarray) -> Optional[np.ndarray]:
+        centers = self.planner.get_frontier_centers()
+        if not centers:
+            return None
+        goal_xy = np.asarray(goal_pos[:2], dtype=float)
+        pos_xy = np.asarray(pos[:2], dtype=float)
+        v = goal_xy - pos_xy
+        nv = float(np.linalg.norm(v))
+        if nv < 1e-9:
+            return None
+        u = v / nv
+
+        best_wp: Optional[np.ndarray] = None
+        best_score = -1e9
+        for c in centers:
+            wp = self._clip_waypoint_to_safe(pos, c[:2])
+            move = wp[:2] - pos_xy
+            move_dist = float(np.linalg.norm(move))
+            if move_dist < 0.18:
+                continue
+            progress = float(np.dot(move, u))
+            lateral = float(np.linalg.norm(move - progress * u))
+            score = progress - 0.35 * lateral
+            if score > best_score:
+                best_score = score
+                best_wp = wp
+
+        if best_wp is not None and best_score > 0.02:
+            return best_wp
+        return None
+
+    def _pick_rightward_frontier(self, pos: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Early exploration bias: before any target is discovered,
+        prefer frontiers that progress to +x (toward right-side rooms).
+        """
+        centers = self.planner.get_frontier_centers()
+        if not centers:
+            return None
+
+        pos_xy = np.asarray(pos[:2], dtype=float)
+        best_wp: Optional[np.ndarray] = None
+        best_score = -1e9
+
+        for c in centers:
+            wp = self._clip_waypoint_to_safe(pos, c[:2])
+            move = wp[:2] - pos_xy
+            move_dist = float(np.linalg.norm(move))
+            if move_dist < 0.20:
+                continue
+            dx = float(move[0])
+            dy = abs(float(move[1]))
+            if dx <= 0.08:
+                continue
+            # Favor forward (+x) progress while discouraging large lateral drift.
+            score = dx - 0.35 * dy
+            if score > best_score:
+                best_score = score
+                best_wp = wp
+
+        if best_wp is not None and best_score > 0.04:
+            return best_wp
+        return None
 
     def _try_transition_to_target_or_done(
         self, pos: np.ndarray, rpy: np.ndarray

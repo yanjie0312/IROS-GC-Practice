@@ -338,8 +338,8 @@ class FrontierPlanner:
             if self._is_directly_reachable(drone_xy, rep):
                 return int(idx), rep.copy()
 
-        fallback_i = int(order[0])
-        return fallback_i, self._cluster_representatives[fallback_i].copy()
+        # No directly reachable representative among current frontier clusters.
+        return -1, None
 
     def _compute_free_space_tree(
         self,
