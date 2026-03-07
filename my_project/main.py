@@ -80,6 +80,14 @@ def main():
         frontier_planner=planner,
         target_manager=target_manager,
         takeoff_height=CRUISE_HEIGHT,
+        waypoint_reach_dist=0.25,
+        frontier_replan_cooldown_steps=10,
+        min_waypoint_delta=0.12,
+        target_retry_cooldown_steps=35,
+        stuck_window_steps=70,
+        stuck_radius=0.22,
+        goto_path_lookahead_dist=0.55,
+        goto_goal_search_radius=0.9,
         verbose=True,
     )
     manager = MissionManager(
@@ -123,11 +131,31 @@ def main():
 
         # 限制水平步长，防止 PID 过大倾斜（目标点离当前位置过远会导致大倾角）
         if not cmd.finished:
+            # 避免任何阶段给出过低高度目标导致掉高
+            cmd.target_pos[2] = max(float(cmd.target_pos[2]), CRUISE_HEIGHT)
+
+            min_dist = float(pkt.get("min_dist", np.inf))
+            collision = bool(pkt.get("collision", False))
+
+            if collision or min_dist < 0.12:
+                # 紧急情况：先刹停并略微抬高
+                cmd.target_pos = np.array(
+                    [pkt["pos"][0], pkt["pos"][1], CRUISE_HEIGHT + 0.05],
+                    dtype=float,
+                )
+
             delta_xy = cmd.target_pos[:2] - pkt["pos"][:2]
             dist_xy = float(np.linalg.norm(delta_xy))
-            if dist_xy > 0.6:
+            if collision or min_dist < 0.18:
+                max_xy_step = 0.10
+            elif min_dist < 0.30:
+                max_xy_step = 0.18
+            else:
+                max_xy_step = 0.35
+
+            if dist_xy > max_xy_step:
                 limited = cmd.target_pos.copy()
-                limited[:2] = pkt["pos"][:2] + delta_xy / dist_xy * 0.6
+                limited[:2] = pkt["pos"][:2] + delta_xy / dist_xy * max_xy_step
                 cmd.target_pos = limited
 
         # 每 5 秒打印进度
