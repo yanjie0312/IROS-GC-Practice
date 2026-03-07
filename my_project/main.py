@@ -1,6 +1,7 @@
 # my_project/main.py
 import time
 import numpy as np
+import pybullet as p
 
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.utils.utils import sync
@@ -67,11 +68,12 @@ def main():
     # 5) 导航栈
     W = float(layout["W"])
     H_layout = float(layout["H"])
+    inset = 0.05
     grid = OccupancyGrid(
         resolution=0.10,
         bounds=GridBounds(
-            x_min=-1.0, x_max=W + 1.0,
-            y_min=-H_layout - 1.0, y_max=H_layout + 1.0,
+            x_min=0.0 + inset, x_max=W - inset,
+            y_min=-H_layout + inset, y_max=H_layout - inset,
         ),
         ray_length=2.5,
     )
@@ -80,6 +82,14 @@ def main():
         frontier_planner=planner,
         target_manager=target_manager,
         takeoff_height=CRUISE_HEIGHT,
+        waypoint_reach_dist=0.25,
+        frontier_replan_cooldown_steps=10,
+        min_waypoint_delta=0.12,
+        target_retry_cooldown_steps=120,
+        stuck_window_steps=180,
+        stuck_radius=0.22,
+        goto_path_lookahead_dist=0.55,
+        goto_goal_search_radius=0.9,
         verbose=True,
     )
     manager = MissionManager(
@@ -112,7 +122,11 @@ def main():
         t = i / env.CTRL_FREQ
 
         # 感知
-        pkt = sensor.sense(obs=obs[0], step=i, t=t)
+        try:
+            pkt = sensor.sense(obs=obs[0], step=i, t=t)
+        except p.error:
+            print("\n=== 物理引擎连接断开，提前结束仿真 ===")
+            break
 
         # 目标巡检计时
         target_manager.update(pkt)
@@ -123,12 +137,69 @@ def main():
 
         # 限制水平步长，防止 PID 过大倾斜（目标点离当前位置过远会导致大倾角）
         if not cmd.finished:
+            # 避免任何阶段给出过低高度目标导致掉高
+            cmd.target_pos[2] = max(float(cmd.target_pos[2]), CRUISE_HEIGHT)
+
+            min_dist = float(pkt.get("min_dist", np.inf))
+            collision = bool(pkt.get("collision", False))
+
+            if collision or min_dist < 0.10:
+                # 紧急情况：按近距离射线合成反推方向脱困，并略微抬高
+                escape_xy = np.zeros(2, dtype=float)
+                ray_dists = np.asarray(pkt.get("ray_dists", []), dtype=float).reshape(-1)
+                ray_dirs_world = np.asarray(pkt.get("ray_dirs_world", []), dtype=float)
+                if (
+                    ray_dists.size > 0
+                    and np.isfinite(ray_dists).any()
+                    and ray_dirs_world.ndim == 2
+                    and ray_dirs_world.shape[0] == ray_dists.size
+                ):
+                    dirs_xy = np.asarray(ray_dirs_world[:, :2], dtype=float)
+                    norms = np.linalg.norm(dirs_xy, axis=1)
+                    valid = norms > 1e-9
+                    near = np.isfinite(ray_dists) & (ray_dists < 0.35) & valid
+                    if np.any(near):
+                        dirs_u = dirs_xy[near] / norms[near][:, None]
+                        weights = (0.35 - ray_dists[near]) / 0.35
+                        rep = (-dirs_u * weights[:, None]).sum(axis=0)
+                        nrep = float(np.linalg.norm(rep))
+                        if nrep > 1e-9:
+                            escape_xy = rep / nrep * 0.30
+                    else:
+                        i_min = int(np.nanargmin(ray_dists))
+                        dxy = np.asarray(ray_dirs_world[i_min, :2], dtype=float)
+                        nxy = float(np.linalg.norm(dxy))
+                        if nxy > 1e-9:
+                            escape_xy = (-dxy / nxy) * 0.24
+
+                if float(np.linalg.norm(escape_xy)) < 1e-9:
+                    # 兜底：沿当前命令方向给一个小步，避免原地不动
+                    desired = np.asarray(cmd.target_pos[:2] - pkt["pos"][:2], dtype=float)
+                    nd = float(np.linalg.norm(desired))
+                    if nd > 1e-9:
+                        escape_xy = desired / nd * 0.18
+                cmd.target_pos = np.array(
+                    [pkt["pos"][0] + escape_xy[0], pkt["pos"][1] + escape_xy[1], CRUISE_HEIGHT + 0.05],
+                    dtype=float,
+                )
+
             delta_xy = cmd.target_pos[:2] - pkt["pos"][:2]
             dist_xy = float(np.linalg.norm(delta_xy))
-            if dist_xy > 0.6:
+            if collision or min_dist < 0.18:
+                max_xy_step = 0.14
+            elif min_dist < 0.30:
+                max_xy_step = 0.24
+            else:
+                max_xy_step = 0.45
+
+            if dist_xy > max_xy_step:
                 limited = cmd.target_pos.copy()
-                limited[:2] = pkt["pos"][:2] + delta_xy / dist_xy * 0.6
+                limited[:2] = pkt["pos"][:2] + delta_xy / dist_xy * max_xy_step
                 cmd.target_pos = limited
+
+            # Hard-bound commands to stay inside apartment envelope.
+            cmd.target_pos[0] = float(np.clip(cmd.target_pos[0], 0.10, W - 0.10))
+            cmd.target_pos[1] = float(np.clip(cmd.target_pos[1], -H_layout + 0.10, H_layout - 0.10))
 
         # 每 5 秒打印进度
         if i % (env.CTRL_FREQ * 5) == 0:
@@ -170,7 +241,10 @@ def main():
         inspected, discovered, total = target_manager.get_progress()
         print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
 
-    env.close()
+    try:
+        env.close()
+    except p.error:
+        pass
 
 
 if __name__ == "__main__":
