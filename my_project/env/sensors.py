@@ -731,6 +731,54 @@ class SensorSuite:
                 visible.add(body_id)
         return visible
 
+    def _apply_target_detection_uncertainty(
+        self,
+        targets_gt: List[Dict[str, Any]],
+        targets_detected: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        对目标检测结果施加不确定性：
+        - false negative：随机漏检已检测到的目标
+        - false positive：随机误检未检测到的目标（从 targets_gt 里选）
+        - position noise / bias：对检测到的目标位置加噪声
+        """
+        result: List[Dict[str, Any]] = []
+
+        detected_ids = {item["target_id"] for item in targets_detected}
+        gt_map = {item["target_id"]: item for item in targets_gt}
+
+        # false negatives：随机丢弃已检测目标
+        for item in targets_detected:
+            if self.target_false_negative_prob > 0.0 and self.rng.random() < self.target_false_negative_prob:
+                continue
+            # position noise + bias
+            noisy = dict(item)
+            if np.any(self.target_pos_noise_std > 0) or np.any(self.target_pos_bias != 0):
+                noisy_pos = (
+                    item["position"].copy()
+                    + self.target_pos_bias
+                    + self.rng.normal(0.0, self.target_pos_noise_std, size=3)
+                )
+                noisy = dict(item)
+                noisy["position"] = noisy_pos
+            result.append(noisy)
+
+        # false positives：随机把未检测到的目标误报
+        if self.target_false_positive_prob > 0.0:
+            for tid, item in gt_map.items():
+                if tid in detected_ids:
+                    continue
+                if self.rng.random() < self.target_false_positive_prob:
+                    noisy = dict(item)
+                    noisy["position"] = (
+                        item["position"].copy()
+                        + self.target_pos_bias
+                        + self.rng.normal(0.0, self.target_pos_noise_std, size=3)
+                    )
+                    result.append(noisy)
+
+        return result
+
     def _draw_debug_rays(self, ray_from: np.ndarray, ray_to: np.ndarray, ray_dists: np.ndarray) -> None:
         for i in range(len(ray_from)):
             ratio = float(ray_dists[i] / max(self.ray_length, 1e-6))
