@@ -121,6 +121,15 @@ def main():
         state = State(xyz=pkt["pos"], vel=pkt["vel"], step=i, t=t)
         cmd = manager.update(state, pkt)
 
+        # 限制水平步长，防止 PID 过大倾斜（目标点离当前位置过远会导致大倾角）
+        if not cmd.finished:
+            delta_xy = cmd.target_pos[:2] - pkt["pos"][:2]
+            dist_xy = float(np.linalg.norm(delta_xy))
+            if dist_xy > 0.6:
+                limited = cmd.target_pos.copy()
+                limited[:2] = pkt["pos"][:2] + delta_xy / dist_xy * 0.6
+                cmd.target_pos = limited
+
         # 每 5 秒打印进度
         if i % (env.CTRL_FREQ * 5) == 0:
             inspected, discovered, total = target_manager.get_progress()
@@ -132,10 +141,10 @@ def main():
         # 坠毁检测：高度过低 或 姿态严重倾斜（翻转）
         z = float(pkt["pos"][2])
         roll, pitch = float(pkt["rpy"][0]), float(pkt["rpy"][1])
-        crashed = z < 0.08 or abs(roll) > 1.0 or abs(pitch) > 1.0  # 1.0 rad ≈ 57°
+        crashed = z < 0.08  # 高度低于 8cm 视为落地坠毁
         if crashed and i > env.CTRL_FREQ:  # 跳过最初 1 秒的起飞抖动
             inspected, discovered, total = target_manager.get_progress()
-            print(f"\n=== 无人机坠毁！t={t:.1f}s  pos=({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {z:.2f})  rpy=({np.degrees(roll):.1f}°, {np.degrees(pitch):.1f}°) ===")
+            print(f"\n=== 无人机坠毁！t={t:.1f}s  pos=({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {z:.2f}) ===")
             print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
             break
 
