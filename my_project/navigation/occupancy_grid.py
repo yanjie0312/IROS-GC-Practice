@@ -159,21 +159,15 @@ class OccupancyGrid:
         return int(self.grid[r, c]) == FREE
 
     def get_frontier_indices(self) -> List[Tuple[int, int]]:
-        grid = self.grid
-        free_mask = grid == FREE
-        if not np.any(free_mask):
-            return []
+        frontiers: List[Tuple[int, int]] = []
+        free_cells = np.argwhere(self.grid == FREE)
 
-        unknown_mask = grid == UNKNOWN
-        neighbor_unknown = np.zeros_like(free_mask, dtype=bool)
-        neighbor_unknown[1:, :] |= unknown_mask[:-1, :]
-        neighbor_unknown[:-1, :] |= unknown_mask[1:, :]
-        neighbor_unknown[:, 1:] |= unknown_mask[:, :-1]
-        neighbor_unknown[:, :-1] |= unknown_mask[:, 1:]
-
-        frontier_mask = free_mask & neighbor_unknown
-        coords = np.argwhere(frontier_mask)
-        return [(int(r), int(c)) for r, c in coords]
+        for r, c in free_cells:
+            for nr, nc in self._neighbors4(int(r), int(c)):
+                if int(self.grid[nr, nc]) == UNKNOWN:
+                    frontiers.append((int(r), int(c)))
+                    break
+        return frontiers
 
     def get_frontiers(self) -> List[np.ndarray]:
         return [self.grid_to_world(r, c) for (r, c) in self.get_frontier_indices()]
