@@ -99,6 +99,23 @@ class TargetManager:
         inspected = sum(1 for info in self.targets.values() if info.inspected)
         return inspected, discovered, total
 
+    def get_nearest_discovered_uninspected(self, drone_pos: np.ndarray) -> Optional[Tuple[int, np.ndarray, float]]:
+        """
+        返回最近的"已被传感器发现但尚未巡检完成"的目标。
+        未被发现的目标不会出现在结果里（无人机不应该提前知道它们在哪）。
+        """
+        drone_pos = np.asarray(drone_pos, dtype=float)
+        best: Optional[Tuple[int, np.ndarray, float]] = None
+
+        for tid, info in self.targets.items():
+            if not info.discovered or info.inspected:
+                continue
+            dist = float(np.linalg.norm(drone_pos - info.position))
+            if best is None or dist < best[2]:
+                best = (tid, info.position.copy(), dist)
+
+        return best
+
     def get_nearest_unvisited(self, drone_pos: np.ndarray) -> Optional[Tuple[int, np.ndarray, float]]:
         """
         返回最近的未巡检目标。
