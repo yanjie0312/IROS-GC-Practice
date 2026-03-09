@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import heapq
 from collections import deque
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from .occupancy_grid import FREE, OCCUPIED, OccupancyGrid
+from .occupancy_grid import FREE, OCCUPIED, UNKNOWN, OccupancyGrid
 
 
 class FrontierPlanner:
@@ -55,6 +56,7 @@ class FrontierPlanner:
         self._no_frontier_steps = 0
         self._done = False
         self._last_selected_xy: np.ndarray | None = None
+        self._last_selected_cluster_center: np.ndarray | None = None
 
     def reset(self) -> None:
         self.grid.reset()
@@ -64,6 +66,7 @@ class FrontierPlanner:
         self._no_frontier_steps = 0
         self._done = False
         self._last_selected_xy = None
+        self._last_selected_cluster_center = None
 
     def update(
         self,
@@ -90,7 +93,13 @@ class FrontierPlanner:
         self._no_frontier_steps = 0
         self._done = False
 
-    def get_next_waypoint(self, drone_pos: Sequence[float]) -> np.ndarray | None:
+    def get_next_waypoint(
+        self, drone_pos: Sequence[float], exclude_xy: Sequence[float] | None = None
+    ) -> np.ndarray | None:
+        """
+        返回下一个 frontier 航点。
+        exclude_xy: 若给定，则排除中心距此点过近的 cluster（用于卡住时换一个方向）
+        """
         if not self._cluster_representatives:
             return None
 
@@ -98,10 +107,11 @@ class FrontierPlanner:
         if drone.size < 2:
             raise ValueError("drone_pos must have at least 2 values")
         drone_xy = drone[:2]
+        excl = np.asarray(exclude_xy, dtype=float).reshape(2) if exclude_xy is not None else None
 
-        best_i, best_xy = self._select_path_reachable_waypoint(drone_xy)
+        best_i, best_xy = self._select_path_reachable_waypoint(drone_xy, exclude_xy=excl)
         if best_xy is None:
-            best_i, best_xy = self._select_direct_reachable_waypoint(drone_xy)
+            best_i, best_xy = self._select_direct_reachable_waypoint(drone_xy, exclude_xy=excl)
         if best_xy is None:
             return None
 
@@ -113,6 +123,8 @@ class FrontierPlanner:
                 f"waypoint=({best_xy[0]:.2f}, {best_xy[1]:.2f})"
             )
 
+        self._last_selected_cluster_center = np.asarray(self._cluster_centers[best_i][:2], dtype=float).copy()
+
         if drone.size >= 3:
             z = float(self.waypoint_z) if self.waypoint_z is not None else float(drone[2])
             return np.array([best_xy[0], best_xy[1], z], dtype=float)
@@ -120,6 +132,10 @@ class FrontierPlanner:
 
     def is_exploration_done(self) -> bool:
         return self._done
+
+    def get_last_selected_cluster_center(self) -> np.ndarray | None:
+        """返回上次选中的 frontier cluster 中心 [x,y]，用于排除该 cluster 时传入 exclude_xy。"""
+        return self._last_selected_cluster_center.copy() if self._last_selected_cluster_center is not None else None
 
     def get_frontier_centers(self) -> List[np.ndarray]:
         return [c.copy() for c in self._cluster_centers]
@@ -158,7 +174,13 @@ class FrontierPlanner:
                 if path:
                     lookahead_cells = int(round(lookahead / max(self.grid.resolution, 1e-6)))
                     lookahead_cells = max(1, lookahead_cells)
-                    path_i = min(lookahead_cells, len(path) - 1)
+                    # 只选与飞机直线可达的路径点，避免指令“穿墙”导致卡住
+                    path_i = 0
+                    for i in range(1, min(lookahead_cells + 1, len(path))):
+                        wp_xy = self.grid.grid_to_world(path[i][0], path[i][1])
+                        if self._is_directly_reachable(drone_xy, wp_xy):
+                            path_i = i
+                    path_i = min(max(1, path_i), len(path) - 1)
                     wp_idx = path[path_i]
                     wp_xy = self.grid.grid_to_world(wp_idx[0], wp_idx[1])
                     return self._pack_xy_with_optional_z(drone, wp_xy)
@@ -288,7 +310,12 @@ class FrontierPlanner:
             return True
         return False
 
-    def _select_path_reachable_waypoint(self, drone_xy: np.ndarray) -> Tuple[int, np.ndarray | None]:
+    def _select_path_reachable_waypoint(
+        self,
+        drone_xy: np.ndarray,
+        exclude_xy: np.ndarray | None = None,
+        exclude_radius: float = 0.5,
+    ) -> Tuple[int, np.ndarray | None]:
         start_idx = self.grid.world_to_grid(drone_xy)
         if start_idx is None:
             return -1, None
@@ -299,6 +326,10 @@ class FrontierPlanner:
         best_path_cost = float("inf")
 
         for i, rep_xy in enumerate(self._cluster_representatives):
+            if exclude_xy is not None and exclude_radius > 0:
+                cxy = self._cluster_centers[i][:2]
+                if float(np.linalg.norm(np.asarray(cxy) - exclude_xy)) < exclude_radius:
+                    continue
             goal_idx = self.grid.world_to_grid(rep_xy)
             if goal_idx is None:
                 continue
@@ -324,7 +355,12 @@ class FrontierPlanner:
         wp_xy = self.grid.grid_to_world(wp_idx[0], wp_idx[1])
         return best_i, wp_xy
 
-    def _select_direct_reachable_waypoint(self, drone_xy: np.ndarray) -> Tuple[int, np.ndarray | None]:
+    def _select_direct_reachable_waypoint(
+        self,
+        drone_xy: np.ndarray,
+        exclude_xy: np.ndarray | None = None,
+        exclude_radius: float = 0.5,
+    ) -> Tuple[int, np.ndarray | None]:
         dists = np.asarray(
             [float(np.linalg.norm(rep - drone_xy)) for rep in self._cluster_representatives],
             dtype=float,
@@ -334,9 +370,14 @@ class FrontierPlanner:
 
         order = np.argsort(dists)
         for idx in order:
-            rep = self._cluster_representatives[int(idx)]
+            i = int(idx)
+            if exclude_xy is not None and exclude_radius > 0:
+                cxy = self._cluster_centers[i][:2]
+                if float(np.linalg.norm(np.asarray(cxy) - exclude_xy)) < exclude_radius:
+                    continue
+            rep = self._cluster_representatives[i]
             if self._is_directly_reachable(drone_xy, rep):
-                return int(idx), rep.copy()
+                return i, rep.copy()
 
         # No directly reachable representative among current frontier clusters.
         return -1, None
@@ -345,6 +386,7 @@ class FrontierPlanner:
         self,
         start_idx: Tuple[int, int],
     ) -> Tuple[np.ndarray, Dict[Tuple[int, int], Tuple[int, int] | None]]:
+        """最短路径树，FREE 代价 1.0，UNKNOWN 代价 2.0，可穿过未观测区域到达 frontier（如门洞）。"""
         h, w = self.grid.height, self.grid.width
         dist = np.full((h, w), np.inf, dtype=np.float32)
         parent: Dict[Tuple[int, int], Tuple[int, int] | None] = {}
@@ -353,21 +395,25 @@ class FrontierPlanner:
         if int(self.grid.grid[sr, sc]) == OCCUPIED:
             return dist, parent
 
-        q = deque([(sr, sc)])
+        # (cost, (r, c)) 优先队列，优先扩展代价小的格
+        heap: List[Tuple[float, Tuple[int, int]]] = [(0.0, (sr, sc))]
         dist[sr, sc] = 0.0
         parent[(sr, sc)] = None
 
-        while q:
-            r, c = q.popleft()
-            base = float(dist[r, c])
+        while heap:
+            base, (r, c) = heapq.heappop(heap)
+            if base > float(dist[r, c]):
+                continue
             for nr, nc in self._navigation_neighbors(r, c):
-                if np.isfinite(dist[nr, nc]):
+                cell = int(self.grid.grid[nr, nc])
+                if cell == OCCUPIED:
                     continue
-                if int(self.grid.grid[nr, nc]) != FREE:
-                    continue
-                dist[nr, nc] = base + 1.0
-                parent[(nr, nc)] = (r, c)
-                q.append((nr, nc))
+                step_cost = 1.0 if cell == FREE else 2.0  # UNKNOWN 代价更高，但仍可穿过
+                new_dist = base + step_cost
+                if new_dist < dist[nr, nc]:
+                    dist[nr, nc] = new_dist
+                    parent[(nr, nc)] = (r, c)
+                    heapq.heappush(heap, (new_dist, (nr, nc)))
 
         return dist, parent
 

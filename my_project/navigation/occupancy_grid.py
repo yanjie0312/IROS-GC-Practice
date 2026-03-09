@@ -132,13 +132,20 @@ class OccupancyGrid:
             dist = float(np.clip(dist, 0.0, self.ray_length))
 
             ray_dir = dirs_xy[i]
-            norm = float(np.linalg.norm(ray_dir))
-            if norm < 1e-9:
+            norm_xy = float(np.linalg.norm(ray_dir))
+            if norm_xy < 1e-9:
                 continue
-            ray_unit = ray_dir / norm
+            ray_unit = ray_dir / norm_xy
+
+            # 使用 2D 投影长度，避免倾斜射线在 2D 上“越过墙”标 FREE（从未进过的房间出现黄色的原因）
+            if dirs.shape[1] >= 3:
+                free_dist_2d = dist * norm_xy  # 3D 射线在 xy 平面上的投影长度
+                free_dist_2d = min(free_dist_2d, self.ray_length)
+            else:
+                free_dist_2d = dist  # 已是平面射线
 
             has_hit = dist < (self.ray_length - self.hit_epsilon)
-            free_dist = max(0.0, dist - self.hit_epsilon) if has_hit else dist
+            free_dist = max(0.0, free_dist_2d - self.hit_epsilon) if has_hit else free_dist_2d
             if free_dist > 1e-9:
                 num_steps = int(np.ceil(free_dist / self.free_sample_step))
                 num_steps = max(1, num_steps)
@@ -148,7 +155,7 @@ class OccupancyGrid:
                     self._mark_free_world(p)
 
             if has_hit:
-                hit_pt = origin_xy + dist * ray_unit
+                hit_pt = origin_xy + free_dist_2d * ray_unit
                 self._mark_occupied_world(hit_pt)
 
     def is_free(self, pos: Sequence[float]) -> bool:

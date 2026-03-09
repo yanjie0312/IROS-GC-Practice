@@ -13,7 +13,7 @@ from my_project.env.sensors import SensorSuite
 from my_project.env.targets import TargetManager
 from my_project.control.pid import PIDController
 from my_project.navigation.base import State
-from my_project.navigation.occupancy_grid import OccupancyGrid, GridBounds
+from my_project.navigation.occupancy_grid import OCCUPIED, FREE, OccupancyGrid, GridBounds
 from my_project.navigation.frontier_planner import FrontierPlanner
 from my_project.navigation.avoidance import AvoidanceLayer
 from my_project.navigation.search_mission import SearchMission
@@ -22,7 +22,13 @@ from my_project.navigation.mission_manager import MissionManager
 
 CRUISE_HEIGHT = 0.5    # 巡航高度（m），低于墙顶 1.0m
 MAX_DURATION_SEC = 300  # 最长运行时间
-
+# 在 PyBullet 窗口用黄色点画出已探索区域（FREE 格）
+SHOW_EXPLORED_OVERLAY = True
+EXPLORED_OVERLAY_SUBSAMPLE = 2  # 每 N 格画一个点
+EXPLORED_OVERLAY_Z = 0.02
+EXPLORED_OVERLAY_INTERVAL = 2   # 每 N 步更新一次
+# 黄色含义：栅格 FREE = 射线曾穿过该格（累积地图），不是「当前射线范围」。
+# 另一房间有黄 = 曾到过该房或 2D 投影下射线经门洞穿过。目标「已发现」= 本帧传感器 LOS，与 FREE 无关。
 
 def main():
     # 1) 创建场景 & 初始化 env
@@ -116,6 +122,8 @@ def main():
     START = time.time()
     steps = int(MAX_DURATION_SEC * env.CTRL_FREQ)
     print("\n=== 任务开始 ===")
+    # 探索 overlay：在弹窗里用黄色点标出已探索区域（FREE），无 frontier 时多半是“已探完当前可见范围”但目标在未探到的地方）
+    _explored_debug_id = None
 
     for i in range(1, steps + 1):
         obs, _, _, _, _ = env.step(action)
@@ -134,6 +142,32 @@ def main():
         # 状态机 + 避障 → 目标点
         state = State(xyz=pkt["pos"], vel=pkt["vel"], step=i, t=t)
         cmd = manager.update(state, pkt)
+
+        # 在 PyBullet 窗口标出已探索区域（黄色 = 栅格 FREE，累积已探可通行区，非当前射线范围）。
+        # 无 frontier 原因见下；目标发现需传感器本帧 LOS，与是否 FREE 无关。
+        if SHOW_EXPLORED_OVERLAY and (i % EXPLORED_OVERLAY_INTERVAL == 0):
+            if _explored_debug_id is not None:
+                try:
+                    p.removeUserDebugItem(_explored_debug_id, physicsClientId=PYB_CLIENT)
+                except p.error:
+                    pass
+                _explored_debug_id = None
+            g = grid.grid
+            subsample = max(1, int(EXPLORED_OVERLAY_SUBSAMPLE))
+            points = []
+            for r in range(0, grid.height, subsample):
+                for c in range(0, grid.width, subsample):
+                    if int(g[r, c]) == FREE:
+                        xy = grid.grid_to_world(r, c)
+                        points.append([float(xy[0]), float(xy[1]), EXPLORED_OVERLAY_Z])
+            if points:
+                _explored_debug_id = p.addUserDebugPoints(
+                    points,
+                    pointColorsRGB=[[1.0, 1.0, 0.0]] * len(points),
+                    pointSize=4.0,
+                    lifeTime=0.0,
+                    physicsClientId=PYB_CLIENT,
+                )
 
         # 限制水平步长，防止 PID 过大倾斜（目标点离当前位置过远会导致大倾角）
         if not cmd.finished:
