@@ -637,7 +637,9 @@ class SensorSuite:
             in_fov = bool(forward and abs(yaw) <= 0.5 * self.target_fov_rad and abs(pitch) <= 0.5 * self.target_fov_rad)
 
             los = self._line_of_sight(state.pos, tpos, tid)
-            visible_gt = bool(dist <= self.target_detect_range and in_fov and los)
+            # Discovery for mission logic should not depend on camera heading.
+            # If a target is within range and line-of-sight, mark it visible.
+            visible_gt = bool(dist <= self.target_detect_range and los)
             visible_cam = bool(tid in camera_visible_ids)
 
             if self.target_mode == "gt":
@@ -710,7 +712,7 @@ class SensorSuite:
             farVal=self.cam_far,
         )
 
-        _, _, _, _, seg = p.getCameraImage(
+        cam_out = p.getCameraImage(
             width=self.cam_width,
             height=self.cam_height,
             viewMatrix=view,
@@ -719,6 +721,9 @@ class SensorSuite:
             flags=p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX,
             physicsClientId=self.client,
         )
+        if cam_out is None or len(cam_out) < 5 or cam_out[4] is None:
+            return set()
+        seg = cam_out[4]
 
         seg_flat = np.asarray(seg).reshape(-1)
         visible: Set[int] = set()

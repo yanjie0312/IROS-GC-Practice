@@ -8,7 +8,7 @@ import numpy as np
 
 from .base import BaseMission, Command, State
 from .frontier_planner import FrontierPlanner
-from .occupancy_grid import OCCUPIED
+from .occupancy_grid import FREE
 from ..env.targets import TargetManager
 
 
@@ -241,13 +241,20 @@ class SearchMission(BaseMission):
                         self._log(f"EXPLORE: region stuck, try other frontier → {wp_other.round(2)}")
                         return Command(target_pos=wp_other, target_rpy=rpy)
                 # 无其他区域或新航点仍在同片区域：向起飞点撤退
-                home_xy = self._home_pos[:2]
-                pos_xy = pos[:2]
-                retreat_xy = pos_xy + 0.7 * (home_xy - pos_xy)
-                retreat_wp = np.array(
-                    [retreat_xy[0], retreat_xy[1], self.takeoff_height],
-                    dtype=float,
+                retreat_wp = self.planner.get_waypoint_towards_goal(
+                    drone_pos=pos,
+                    goal_pos=self._home_pos[:2],
+                    lookahead_dist=1.0,
+                    goal_search_radius=1.2,
                 )
+                if retreat_wp is None:
+                    home_xy = self._home_pos[:2]
+                    pos_xy = pos[:2]
+                    retreat_xy = pos_xy + 0.7 * (home_xy - pos_xy)
+                    retreat_wp = np.array(
+                        [retreat_xy[0], retreat_xy[1], self.takeoff_height],
+                        dtype=float,
+                    )
                 self._current_waypoint = retreat_wp
                 self._region_retreat_until_step = self._cur_step + self._region_retreat_duration_steps
                 self._last_frontier_pick_step = self._cur_step
@@ -286,14 +293,23 @@ class SearchMission(BaseMission):
             ):
                 dist_wp_to_anchor = float(np.linalg.norm(wp[:2] - self._region_anchor_pos[:2]))
                 if dist_wp_to_anchor < self._region_anchor_update_dist:
-                    home_xy = self._home_pos[:2]
-                    pos_xy = pos[:2]
-                    step_back = pos_xy + 0.35 * (home_xy - pos_xy)
-                    wp = np.array(
-                        [step_back[0], step_back[1], self.takeoff_height],
-                        dtype=float,
+                    detour_wp = self.planner.get_waypoint_towards_goal(
+                        drone_pos=pos,
+                        goal_pos=self._home_pos[:2],
+                        lookahead_dist=0.7,
+                        goal_search_radius=1.2,
                     )
-                    self._log("EXPLORE: same region, step toward home to exit")
+                    if detour_wp is not None:
+                        wp = detour_wp
+                    else:
+                        home_xy = self._home_pos[:2]
+                        pos_xy = pos[:2]
+                        step_back = pos_xy + 0.35 * (home_xy - pos_xy)
+                        wp = np.array(
+                            [step_back[0], step_back[1], self.takeoff_height],
+                            dtype=float,
+                        )
+                    self._log("EXPLORE: same region, detour toward home to exit")
             if wp is not None:
                 if force_replan or float(np.linalg.norm(wp[:2] - self._current_waypoint[:2])) >= self.min_waypoint_delta:
                     self._current_waypoint = wp
@@ -418,6 +434,21 @@ class SearchMission(BaseMission):
                 return Command(target_pos=hover, target_rpy=rpy)
 
             # 探索完成且无目标 → DONE
+            # Safety fallback: do not finish while uninspected targets still exist.
+            if total2 > 0 and inspected2 < total2:
+                wp = self._pick_next_frontier(pos)
+                if wp is not None:
+                    self._current_waypoint = wp
+                    self._last_frontier_pick_step = self._cur_step
+                    self._phase = _Phase.EXPLORE
+                    self._reset_stuck_anchor(pos)
+                    self._log("EXPLORE (still have uninspected target)")
+                    return Command(target_pos=wp, target_rpy=rpy)
+                hover = np.array([pos[0], pos[1], self.takeoff_height], dtype=float)
+                self._phase = _Phase.EXPLORE
+                self._log("EXPLORE (uninspected target remains, hold)")
+                return Command(target_pos=hover, target_rpy=rpy)
+
             self._phase = _Phase.DONE
             self._current_waypoint = self._home_pos.copy()
             self._log("→ DONE")
@@ -537,7 +568,7 @@ class SearchMission(BaseMission):
             idx = self.planner.grid.world_to_grid(candidate)
             if idx is None:
                 break
-            if self.planner.grid.grid[idx[0], idx[1]] == OCCUPIED:
+            if self.planner.grid.grid[idx[0], idx[1]] != FREE:
                 break
             safe_xy = candidate
             d += check_step
@@ -650,18 +681,60 @@ class SearchMission(BaseMission):
                 return Command(target_pos=approach_wp, target_rpy=rpy)
 
         # 无“已发现且未巡检”目标时，检查是否还有未发现的目标
-        _, discovered, total = self.target_manager.get_progress()
-        if total > 0 and discovered < total:
+
+            # Target is known but currently unreachable: do NOT finish mission.
+            self._phase = _Phase.EXPLORE
+            self._next_target_attempt_step = self._cur_step + self.target_retry_cooldown_steps
+            self._current_target_id = tid
+            self._current_target_pos = np.asarray(tpos, dtype=float).copy()
+
+            guided_wp = self._pick_frontier_towards(pos, tpos)
+            if guided_wp is None:
+                guided_wp = self._pick_next_frontier(pos)
+            if guided_wp is not None:
+                self._current_waypoint = guided_wp
+                self._last_frontier_pick_step = self._cur_step
+                self._log(f"Exploration done, target {tid} unreachable -> EXPLORE toward target")
+                return Command(target_pos=guided_wp, target_rpy=rpy)
+
+            hold = np.array([pos[0], pos[1], self.takeoff_height], dtype=float)
+            self._log(f"Exploration done, target {tid} unreachable and no frontier -> HOLD")
+            return Command(target_pos=hold, target_rpy=rpy)
+
+        inspected, discovered, total = self.target_manager.get_progress()
+        if total > 0 and inspected < total:
+            if discovered >= total:
+                nearest_unvisited = self.target_manager.get_nearest_unvisited(pos)
+                if nearest_unvisited is not None:
+                    _, tpos, _ = nearest_unvisited
+                    guided_wp = self._pick_frontier_towards(pos, tpos)
+                    if guided_wp is not None:
+                        self._current_waypoint = guided_wp
+                        self._last_frontier_pick_step = self._cur_step
+                        self._phase = _Phase.EXPLORE
+                        self._log("Exploration done fallback: uninspected target remains -> EXPLORE")
+                        return Command(target_pos=guided_wp, target_rpy=rpy)
+                hold = np.array([pos[0], pos[1], self.takeoff_height], dtype=float)
+                self._phase = _Phase.EXPLORE
+                self._log("Exploration done fallback: uninspected target remains -> HOLD")
+                return Command(target_pos=hold, target_rpy=rpy)
             # 仍有未发现目标：不悬停死等，向起飞点撤退一段，换位置后可能重新出现 frontier
             # 仅当当前不在撤退阶段时才发起新一轮撤退，避免每帧重置
             if self._region_retreat_until_step < 0 or self._cur_step >= self._region_retreat_until_step:
-                home_xy = self._home_pos[:2]
-                pos_xy = pos[:2]
-                retreat_xy = pos_xy + 0.7 * (home_xy - pos_xy)
-                retreat_wp = np.array(
-                    [retreat_xy[0], retreat_xy[1], self.takeoff_height],
-                    dtype=float,
+                retreat_wp = self.planner.get_waypoint_towards_goal(
+                    drone_pos=pos,
+                    goal_pos=self._home_pos[:2],
+                    lookahead_dist=1.0,
+                    goal_search_radius=1.2,
                 )
+                if retreat_wp is None:
+                    home_xy = self._home_pos[:2]
+                    pos_xy = pos[:2]
+                    retreat_xy = pos_xy + 0.7 * (home_xy - pos_xy)
+                    retreat_wp = np.array(
+                        [retreat_xy[0], retreat_xy[1], self.takeoff_height],
+                        dtype=float,
+                    )
                 self._current_waypoint = retreat_wp
                 self._region_retreat_until_step = self._cur_step + self._region_retreat_duration_steps
                 if self._cur_step - self._last_nofrontier_log_step >= 240:

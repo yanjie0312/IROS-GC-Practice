@@ -6,7 +6,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-from .occupancy_grid import FREE, OCCUPIED, UNKNOWN, OccupancyGrid
+from .occupancy_grid import FREE, OCCUPIED, OccupancyGrid
 
 
 class FrontierPlanner:
@@ -350,7 +350,12 @@ class FrontierPlanner:
 
         lookahead_cells = int(round(self.path_lookahead_dist / max(self.grid.resolution, 1e-6)))
         lookahead_cells = max(1, lookahead_cells)
-        path_i = min(lookahead_cells, len(path) - 1)
+        max_i = min(lookahead_cells, len(path) - 1)
+        path_i = 1
+        for i in range(1, max_i + 1):
+            candidate_xy = self.grid.grid_to_world(path[i][0], path[i][1])
+            if self._is_directly_reachable(drone_xy, candidate_xy):
+                path_i = i
         wp_idx = path[path_i]
         wp_xy = self.grid.grid_to_world(wp_idx[0], wp_idx[1])
         return best_i, wp_xy
@@ -406,10 +411,9 @@ class FrontierPlanner:
                 continue
             for nr, nc in self._navigation_neighbors(r, c):
                 cell = int(self.grid.grid[nr, nc])
-                if cell == OCCUPIED:
+                if cell != FREE:
                     continue
-                step_cost = 1.0 if cell == FREE else 2.0  # UNKNOWN 代价更高，但仍可穿过
-                new_dist = base + step_cost
+                new_dist = base + 1.0
                 if new_dist < dist[nr, nc]:
                     dist[nr, nc] = new_dist
                     parent[(nr, nc)] = (r, c)
@@ -471,7 +475,7 @@ class FrontierPlanner:
             idx = self.grid.world_to_grid(p)
             if idx is None:
                 return False
-            if int(self.grid.grid[idx[0], idx[1]]) == OCCUPIED:
+            if int(self.grid.grid[idx[0], idx[1]]) != FREE:
                 return False
         return True
 

@@ -77,6 +77,9 @@ class TargetManager:
             # 巡检：计算距离，在范围内累加时间
             dist = float(np.linalg.norm(drone_pos - info.position))
             if dist <= self.inspect_range:
+                # Safety fallback: if we are close enough to inspect, it should count as discovered.
+                if not info.discovered:
+                    info.discovered = True
                 info.time_in_range += dt
                 if info.time_in_range >= self.inspect_time:
                     info.inspected = True
