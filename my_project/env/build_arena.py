@@ -446,16 +446,17 @@ def create_arena(scenario, client_id: Optional[int] = None) -> Dict[str, List[in
 
         return 0.0, 0.0
 
-    # ---- 4.4 生成随机障碍 ----
+    # ---- 4.4 生成随机障碍（位置与尺寸每次启动随机；数量仍由难度 scenario.num_obstacles 决定）----
+    obstacle_rng = np.random.default_rng((int(time.time() * 1000) + 7919) & 0x7FFFFFFF)
     obstacle_ids: List[int] = []
     for _ in range(int(scenario.num_obstacles)):
-        size = float(rng.uniform(float(scenario.obstacle_min_size), float(scenario.obstacle_max_size)))
-        height = float(rng.uniform(float(scenario.obstacle_min_height), float(scenario.obstacle_max_height)))
+        size = float(obstacle_rng.uniform(float(scenario.obstacle_min_size), float(scenario.obstacle_max_size)))
+        height = float(obstacle_rng.uniform(float(scenario.obstacle_min_height), float(scenario.obstacle_max_height)))
 
         hx, hy, hz = size / 2.0, size / 2.0, height / 2.0
         r_approx = max(hx, hy) * 1.4
 
-        x, y = sample_xy_from_rooms(r_approx, int(scenario.max_sample_tries))
+        x, y = sample_xy_from_rooms(r_approx, int(scenario.max_sample_tries), rng_override=obstacle_rng)
         placed.append((x, y, r_approx))
 
         oid = _create_box_body(
@@ -467,16 +468,17 @@ def create_arena(scenario, client_id: Optional[int] = None) -> Dict[str, List[in
         )
         obstacle_ids.append(oid)
 
-    # ---- 4.5 生成 no-fly（实体薄板，可选）----
+    # ---- 4.5 生成 no-fly（位置与尺寸每次启动随机；数量仍由 scenario.num_nofly 决定）----
     nofly_ids: List[int] = []
     if bool(getattr(scenario, "nofly_is_solid", True)):
+        nofly_rng = np.random.default_rng((int(time.time() * 1000) + 3721) & 0x7FFFFFFF)
         for _ in range(int(scenario.num_nofly)):
-            size = float(rng.uniform(float(scenario.nofly_min_size), float(scenario.nofly_max_size)))
+            size = float(nofly_rng.uniform(float(scenario.nofly_min_size), float(scenario.nofly_max_size)))
             hx, hy = size / 2.0, size / 2.0
             hz = 0.02  # half height
 
             r_approx = max(hx, hy) * 1.4
-            x, y = sample_xy_from_rooms(r_approx, int(scenario.max_sample_tries))
+            x, y = sample_xy_from_rooms(r_approx, int(scenario.max_sample_tries), rng_override=nofly_rng)
             placed.append((x, y, r_approx))
 
             nid = _create_box_body(
@@ -491,7 +493,7 @@ def create_arena(scenario, client_id: Optional[int] = None) -> Dict[str, List[in
         nofly_ids = []
 
     # ---- 4.6 生成 targets（圆柱）；位置每次启动随机，且在房间内、离墙保留间距 ----
-    # 使用与时间相关的种子，使每次运行目标点位置不同；障碍/nofly 仍用 scenario.seed 可复现
+    # 目标、障碍、nofly 均用时间相关种子，每次运行位置/尺寸随机；难度（数量、尺寸范围）仍由 scenario 决定
     target_rng = np.random.default_rng(int(time.time() * 1000) & 0x7FFFFFFF)
     target_margin_from_wall = 0.25  # 目标与墙的最小距离（米）
     target_ids: List[int] = []
