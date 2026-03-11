@@ -87,6 +87,14 @@ class Scenario:
     pos_noise_std: float = 0.0                         # 位置噪声标准差（m）
     yaw_noise_std: float = 0.0                         # 偏航角噪声标准差（rad）
     ray_noise_std: float = 0.0                         # raycast 测距噪声标准差（m）
+    # 目标检测：估计坐标 = 无人机位置+测距×测向（仅用测量，不给真实坐标）；可加测距/测向噪声
+    target_pos_noise_std: float = 0.0                  # 在估计上再叠加的位置噪声（可选）
+    target_pos_bias: Optional[Tuple[float, float, float]] = None
+    target_range_noise_std: float = 0.0                 # 测距噪声标准差（m）
+    target_bearing_noise_std: float = 0.0               # 测向噪声标准差（rad）
+    target_range_bias: float = 0.0                      # 测距偏差（m）
+    target_false_negative_prob: float = 0.0             # 漏检概率
+    # 上几项影响：导航用估计坐标；巡检判定仍用 GT；噪声大时可适当增大 inspect_range
 
     dropout_prob: float = 0.0                          # 观测丢包概率（0~1）
     delay_steps: int = 0                               # 观测延迟步数（0 表示无延迟）

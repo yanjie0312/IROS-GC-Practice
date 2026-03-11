@@ -61,6 +61,12 @@ def main():
         pyb_client_id=PYB_CLIENT,
         drone_id=DRONE_ID,
         arena_handle=arena_handle,
+        target_pos_noise_std=getattr(scenario, "target_pos_noise_std", 0.0),
+        target_pos_bias=getattr(scenario, "target_pos_bias", None),
+        target_range_noise_std=getattr(scenario, "target_range_noise_std", 0.0),
+        target_bearing_noise_std=getattr(scenario, "target_bearing_noise_std", 0.0),
+        target_range_bias=getattr(scenario, "target_range_bias", 0.0),
+        target_false_negative_prob=getattr(scenario, "target_false_negative_prob", 0.0),
     )
 
     # 4) 目标管理
@@ -251,6 +257,9 @@ def main():
             inspected, discovered, total = target_manager.get_progress()
             print(f"\n=== 无人机坠毁！t={t:.1f}s  pos=({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {z:.2f}) ===")
             print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
+            for r in target_manager.get_inspection_result():
+                if r["inspected"]:
+                    print(f"  目标 id={r['id']}  测得坐标(传感器)=[{r['measured_xyz'][0]:.3f}, {r['measured_xyz'][1]:.3f}, {r['measured_xyz'][2]:.3f}]")
             break
 
         # 任务完成
@@ -258,6 +267,9 @@ def main():
             print(f"\n=== 任务完成！用时 {t:.1f}s ===")
             inspected, discovered, total = target_manager.get_progress()
             print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
+            for r in target_manager.get_inspection_result():
+                if r["inspected"]:
+                    print(f"  目标 id={r['id']}  测得坐标(传感器)=[{r['measured_xyz'][0]:.3f}, {r['measured_xyz'][1]:.3f}, {r['measured_xyz'][2]:.3f}]")
             break
 
         # PID 计算电机输出
@@ -274,6 +286,9 @@ def main():
         print(f"\n=== 超时（{MAX_DURATION_SEC}s）===")
         inspected, discovered, total = target_manager.get_progress()
         print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
+        for r in target_manager.get_inspection_result():
+            if r["inspected"]:
+                print(f"  目标 id={r['id']}  测得坐标(传感器)=[{r['measured_xyz'][0]:.3f}, {r['measured_xyz'][1]:.3f}, {r['measured_xyz'][2]:.3f}]")
 
     try:
         env.close()

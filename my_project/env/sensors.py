@@ -131,6 +131,9 @@ class SensorSuite:
         target_false_positive_prob: float = 0.0,
         target_pos_noise_std: float | Sequence[float] = 0.0,
         target_pos_bias: float | Sequence[float] | None = None,
+        target_range_noise_std: float = 0.0,
+        target_bearing_noise_std: float = 0.0,
+        target_range_bias: float = 0.0,
         # ---------- packet delay/loss ----------
         measurement_delay_steps: int = 0,
         packet_drop_prob: float = 0.0,
@@ -198,6 +201,9 @@ class SensorSuite:
         self.target_false_positive_prob = float(np.clip(target_false_positive_prob, 0.0, 1.0))
         self.target_pos_noise_std = _as_vec3(target_pos_noise_std, 0.0)
         self.target_pos_bias = _as_vec3(target_pos_bias, 0.0)
+        self.target_range_noise_std = float(max(0.0, target_range_noise_std))
+        self.target_bearing_noise_std = float(max(0.0, target_bearing_noise_std))
+        self.target_range_bias = float(target_range_bias)
 
         self.measurement_delay_steps = int(max(0, measurement_delay_steps))
         self.packet_drop_prob = float(np.clip(packet_drop_prob, 0.0, 1.0))
@@ -668,9 +674,35 @@ class SensorSuite:
             }
             targets_gt.append(info)
             if visible:
-                targets_detected.append(dict(info))
+                out = dict(info)
+                # 估计坐标只由「无人机位置 + 测距×测向」得到，不把真实坐标 tpos 给无人机
+                out["position"] = self._target_position_from_measurement(state.pos, dist, vec_w)
+                targets_detected.append(out)
 
         return targets_gt, targets_detected
+
+    def _target_position_from_measurement(
+        self, drone_pos: np.ndarray, range_true: float, vec_to_target: np.ndarray
+    ) -> np.ndarray:
+        """仅用无人机位置 + 带噪声的测距与测向推算目标位置，不使用真实目标坐标。"""
+        range_meas = range_true + self.target_range_bias + float(
+            self.rng.normal(0.0, self.target_range_noise_std)
+        )
+        range_meas = max(1e-3, range_meas)
+        dir_true = np.asarray(vec_to_target, dtype=float) / (float(np.linalg.norm(vec_to_target)) + 1e-9)
+        if self.target_bearing_noise_std <= 0:
+            dir_meas = dir_true
+        else:
+            u = dir_true
+            v = np.array([-u[1], u[0], 0.0], dtype=float) if abs(u[2]) < 0.9 else np.array([0.0, -u[2], u[1]], dtype=float)
+            v = v / (np.linalg.norm(v) + 1e-9)
+            w = np.cross(u, v)
+            w = w / (np.linalg.norm(w) + 1e-9)
+            angle = float(self.rng.normal(0.0, self.target_bearing_noise_std))
+            dir_meas = u + angle * (v * self.rng.standard_normal() + w * self.rng.standard_normal())
+            n = np.linalg.norm(dir_meas)
+            dir_meas = dir_meas / n if n >= 1e-9 else dir_true
+        return np.asarray(drone_pos, dtype=float) + range_meas * dir_meas
 
     def _line_of_sight(self, start_pos: np.ndarray, target_pos: np.ndarray, target_id: int) -> bool:
         direction = target_pos - start_pos

@@ -96,6 +96,7 @@ class SearchMission(BaseMission):
         self._region_stuck_radius = 1.0
         self._region_stuck_steps = 400
         self._region_retreat_duration_steps = 150
+        self._just_finished_retreat = False
         self._region_anchor_update_dist = 1.5
         self._retreat_waypoint_min_dist = 1.0
         # 同区域内重规划次数超过此次数也视为区域卡住（不必等 400 步）
@@ -129,6 +130,7 @@ class SearchMission(BaseMission):
         self._region_retreat_until_step = -1
         self._region_replan_count = 0
         self._last_nofrontier_log_step = -10**9
+        self._just_finished_retreat = False
         self._done_stuck_anchor_dist = -1.0
         self._done_stuck_anchor_step = -1
         self.planner.reset()
@@ -206,6 +208,8 @@ class SearchMission(BaseMission):
                 self._region_retreat_until_step = -1
                 self._region_anchor_pos = np.asarray(pos, dtype=float).copy()
                 self._region_anchor_step = self._cur_step
+                self._region_replan_count = 0
+                self._just_finished_retreat = True  # 下一帧选 frontier 时排除原 cluster，强制尝试其他房间
                 self._log("EXPLORE: retreat reached, resuming exploration")
                 # 继续执行下面逻辑，选新 frontier
             else:
@@ -272,10 +276,13 @@ class SearchMission(BaseMission):
             ):
                 return Command(target_pos=self._current_waypoint.copy(), target_rpy=rpy)
 
-            # 卡住时排除当前航点所在 cluster；同区域已重规划多次时也排除当前方向，主动换 cluster
-            # 排除时用「上次选中的 cluster 中心」才能正确排除该 cluster（航点可能离中心很远）
+            # 卡住时排除当前航点所在 cluster；同区域已重规划多次时也排除当前方向；刚撤退完也排除原 cluster 以换房间
             exclude = None
-            if force_replan or (
+            if self._just_finished_retreat:
+                center = self.planner.get_last_selected_cluster_center()
+                exclude = center if center is not None else self._current_waypoint[:2]
+                self._just_finished_retreat = False
+            elif force_replan or (
                 self._region_replan_count >= self._region_exclude_after_replans
                 and float(np.linalg.norm(pos[:2] - self._region_anchor_pos[:2])) <= self._region_stuck_radius
             ):
@@ -493,6 +500,10 @@ class SearchMission(BaseMission):
                 wp[2] = self.takeoff_height
             else:
                 wp = np.array([float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float)
+            # 若路径点比当前位置更远离 home，说明路径绕远，直接飞 home 避免越飞越远
+            dist_wp_to_home = float(np.linalg.norm(wp[:2] - home[:2]))
+            if dist_wp_to_home > dist:
+                wp = home.copy()
             return Command(
                 target_pos=wp,
                 target_rpy=rpy,
