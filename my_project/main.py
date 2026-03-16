@@ -8,6 +8,7 @@ from gym_pybullet_drones.utils.utils import sync
 
 from my_project.config import CFG
 from my_project.env.build_arena import create_arena, get_layout
+from my_project.env.disturbances import DisturbanceInjector
 from my_project.experiments.scenarios import make_scenario
 from my_project.env.sensors import SensorSuite
 from my_project.env.targets import TargetManager
@@ -32,7 +33,10 @@ EXPLORED_OVERLAY_INTERVAL = 2   # 每 N 步更新一次
 
 def main():
     # 1) 创建场景 & 初始化 env
-    scenario = make_scenario("easy", seed=42)
+    scenario = make_scenario(
+        CFG.get("difficulty_profile", "L0_easy"),
+        seed=int(CFG.get("scenario_seed", 42)),
+    )
     layout = get_layout(scenario.layout_name)
 
     INIT_XYZS = np.array([[0.5, 0.0, CFG["flight_height"]]])
@@ -61,13 +65,52 @@ def main():
         pyb_client_id=PYB_CLIENT,
         drone_id=DRONE_ID,
         arena_handle=arena_handle,
+        state_noise_std_pos=float(scenario.pos_noise_std),
+        state_noise_std_rpy=(0.0, 0.0, float(scenario.yaw_noise_std)),
+        ray_noise_std=float(scenario.ray_noise_std),
+        measurement_delay_steps=int(scenario.delay_steps),
+        packet_drop_prob=float(scenario.dropout_prob),
         target_pos_noise_std=getattr(scenario, "target_pos_noise_std", 0.0),
         target_pos_bias=getattr(scenario, "target_pos_bias", None),
         target_range_noise_std=getattr(scenario, "target_range_noise_std", 0.0),
         target_bearing_noise_std=getattr(scenario, "target_bearing_noise_std", 0.0),
         target_range_bias=getattr(scenario, "target_range_bias", 0.0),
         target_false_negative_prob=getattr(scenario, "target_false_negative_prob", 0.0),
+        rng_seed=int(scenario.seed),
     )
+
+    # 3.1) 扰动注入器：L0_easy 下所有参数为 0，不影响当前可运行行为
+    disturbance_cfg = dict(CFG.get("disturbance", {}))
+    disturbance_cfg.update(
+        {
+            "wind_std": float(scenario.wind_std),
+            "wind_bias_xy": tuple(scenario.wind_bias_xy),
+            "gust_prob": float(scenario.gust_prob),
+            "gust_strength": float(scenario.gust_strength),
+            "state_noise_std_pos": float(scenario.pos_noise_std),
+            "state_noise_std_rpy": (0.0, 0.0, float(scenario.yaw_noise_std)),
+            "ray_noise_std": float(scenario.ray_noise_std),
+            "packet_dropout_prob": float(scenario.dropout_prob),
+            "measurement_delay_steps": int(scenario.delay_steps),
+            "payload_mass_delta": float(scenario.payload_mass_delta),
+        }
+    )
+    disturbance = DisturbanceInjector(
+        pyb_client_id=PYB_CLIENT,
+        drone_id=DRONE_ID,
+        config=disturbance_cfg,
+    )
+    disturbance.reset(seed=int(scenario.seed) + 101)
+    try:
+        base_mass = float(p.getDynamicsInfo(DRONE_ID, -1, physicsClientId=PYB_CLIENT)[0])
+        payload_delta = disturbance.sample_payload_variation(
+            base_mass=base_mass,
+            apply_to_simulation=True,
+        )
+        if abs(payload_delta) > 1e-9:
+            print(f"[disturbance] payload delta mass = {payload_delta:+.5f} kg")
+    except p.error:
+        pass
 
     # 4) 目标管理
     target_manager = TargetManager(
@@ -126,7 +169,7 @@ def main():
 
     # 8) 主循环
     START = time.time()
-    steps = int(MAX_DURATION_SEC * env.CTRL_FREQ)
+    steps = int(max(1, scenario.timeout_steps))
     print("\n=== 任务开始 ===")
     # 探索 overlay：在弹窗里用黄色点标出已探索区域（FREE），无 frontier 时多半是“已探完当前可见范围”但目标在未探到的地方）
     _explored_debug_id = None
@@ -144,6 +187,12 @@ def main():
 
         # 目标巡检计时
         target_manager.update(pkt)
+
+        # 物理扰动注入（L0_easy 时输出零力）
+        try:
+            disturbance.apply_physics_disturbance(drone_pos=pkt["pos"], apply_to_simulation=True)
+        except p.error:
+            pass
 
         # 状态机 + 避障 → 目标点
         state = State(xyz=pkt["pos"], vel=pkt["vel"], step=i, t=t)
@@ -283,7 +332,8 @@ def main():
         sync(i, START, env.CTRL_TIMESTEP)
 
     else:
-        print(f"\n=== 超时（{MAX_DURATION_SEC}s）===")
+        timeout_sec = float(steps) / float(env.CTRL_FREQ)
+        print(f"\n=== 超时（{timeout_sec:.1f}s）===")
         inspected, discovered, total = target_manager.get_progress()
         print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
         for r in target_manager.get_inspection_result():
