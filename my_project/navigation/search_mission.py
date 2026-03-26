@@ -53,6 +53,9 @@ class SearchMission(BaseMission):
         stuck_radius: float = 0.25,
         goto_path_lookahead_dist: float = 0.6,
         goto_goal_search_radius: float = 0.8,
+        l1_explore_hardening: bool = False,
+        l2_explore_hardening: bool = False,
+        l3_explore_hardening: bool = False,
         verbose: bool = True,
     ):
         """
@@ -63,6 +66,9 @@ class SearchMission(BaseMission):
         takeoff_height     : 巡航高度（m）
         waypoint_reach_dist: 判定"到达 frontier 航点"的水平距离阈值（m）
         inspect_hover_dist : 判定"到达目标"切换 INSPECT 的距离阈值（m）
+        l1_explore_hardening: 仅 L1 启用（更快触发同区 anti-loop 侧向强脱困，避免 detour 循环）
+        l2_explore_hardening: 仅 L2 启用（同区 detour 使用更快 anti-loop，避免出来又回去循环）
+        l3_explore_hardening: 仅 L3 启用（贴地 z 归一、同区绕路 anti-loop、重规划冷却等）
         verbose            : 是否打印状态机转换日志
         """
         self.planner = frontier_planner
@@ -77,6 +83,9 @@ class SearchMission(BaseMission):
         self.stuck_radius = float(max(0.05, stuck_radius))
         self.goto_path_lookahead_dist = float(max(0.05, goto_path_lookahead_dist))
         self.goto_goal_search_radius = float(max(0.1, goto_goal_search_radius))
+        self._l1_explore_hardening = bool(l1_explore_hardening)
+        self._l2_explore_hardening = bool(l2_explore_hardening)
+        self._l3_explore_hardening = bool(l3_explore_hardening)
         self.verbose = verbose
 
         self._phase = _Phase.TAKEOFF
@@ -97,18 +106,47 @@ class SearchMission(BaseMission):
         self._region_stuck_steps = 400
         self._region_retreat_duration_steps = 150
         self._just_finished_retreat = False
+        # 防抖：retreat 刚结束后短时间内禁止再次进入 retreat，避免日志刷屏与状态抖动
+        self._retreat_resume_cooldown_steps = 120
+        self._retreat_resume_block_until_step = -1
+        # region 锚点更新阈值：越小越容易判定“已经换到新区域”
         self._region_anchor_update_dist = 1.5
+        if self._l2_explore_hardening:
+            # L2：当位于门洞附近时，位移可能达不到 1.5m；过大的阈值会导致 region 锚点长期不更新
+            # 从而覆盖率停留在局部口袋，出现“出来又回去”的往返循环。
+            self._region_anchor_update_dist = 1.2
         self._retreat_waypoint_min_dist = 1.0
         # 同区域内重规划次数超过此次数也视为区域卡住（不必等 400 步）
         self._region_stuck_replan_threshold = 10
         self._region_replan_count = 0
         # 同区域重规划超过此次数后，每次选点都排除当前方向，主动换 cluster
         self._region_exclude_after_replans = 5
+        self._same_region_detour_count = 0
+        self._same_region_detour_escape_threshold = 12
+        if self._l1_explore_hardening:
+            # L1：避免同区 detour toward home to exit 循环往复时 anti-loop 触发过慢
+            self._same_region_detour_escape_threshold = 6
+        elif self._l2_explore_hardening:
+            # L2：同区 detour toward home to exit 容易“出来又回去”，稍微提前触发侧向强脱困
+            self._same_region_detour_escape_threshold = 8
+        elif self._l3_explore_hardening:
+            # L3：降低触发阈值，避免长时间徘徊在同一口袋/走廊附近
+            self._same_region_detour_escape_threshold = 9
+        self._last_detour_log_step = -10**9
         # 无 frontier 时“仍有未发现目标”的日志节流，避免每帧刷屏
         self._last_nofrontier_log_step = -10**9
         # 返航阶段卡住检测：无进展时缩短 lookahead
         self._done_stuck_anchor_dist: float = -1.0
         self._done_stuck_anchor_step: int = -1
+        # force_replan 连续选出与当前航点几乎相同的 xy 时，强制向 home 迈一步打破死循环
+        self._explore_identical_replan_count = 0
+        # L3：探索结束但目标栅格不可达时，frontier 可能帧间闪烁；冷却重试并节流日志
+        self._unreachable_frontier_next_try_step = -10**9
+        self._last_unreachable_explore_log_step = -10**9
+        self._last_unreachable_hold_log_step = -10**9
+        # L2：retreat 离开一个房间后，短时间内禁止重新选回同一房间 frontier
+        self._l2_retreat_exclude_center: np.ndarray | None = None
+        self._l2_retreat_exclude_until_step: int = -1
     # ------------------------------------------------------------------
 
     def reset(self, state: State) -> None:
@@ -129,10 +167,19 @@ class SearchMission(BaseMission):
         self._region_anchor_step = self._cur_step
         self._region_retreat_until_step = -1
         self._region_replan_count = 0
+        self._same_region_detour_count = 0
         self._last_nofrontier_log_step = -10**9
         self._just_finished_retreat = False
+        self._retreat_resume_block_until_step = -1
+        self._last_detour_log_step = -10**9
         self._done_stuck_anchor_dist = -1.0
         self._done_stuck_anchor_step = -1
+        self._explore_identical_replan_count = 0
+        self._unreachable_frontier_next_try_step = -10**9
+        self._last_unreachable_explore_log_step = -10**9
+        self._last_unreachable_hold_log_step = -10**9
+        self._l2_retreat_exclude_center = None
+        self._l2_retreat_exclude_until_step = -1
         self.planner.reset()
         self._log(f"reset → TAKEOFF  home={self._home_pos.round(2)}")
 
@@ -210,10 +257,28 @@ class SearchMission(BaseMission):
                 self._region_anchor_step = self._cur_step
                 self._region_replan_count = 0
                 self._just_finished_retreat = True  # 下一帧选 frontier 时排除原 cluster，强制尝试其他房间
+                if self._l3_explore_hardening or self._l2_explore_hardening:
+                    cooldown = (
+                        self._retreat_resume_cooldown_steps
+                        if self._l3_explore_hardening
+                        else int(self._retreat_resume_cooldown_steps * 0.5)
+                    )
+                    self._retreat_resume_block_until_step = self._cur_step + cooldown
+                # L2：记录离开房间时的 cluster center，短时间内保持 exclude，避免“出来后又回去”
+                if self._l2_explore_hardening:
+                    center = self.planner.get_last_selected_cluster_center()
+                    self._l2_retreat_exclude_center = (
+                        center.astype(float) if center is not None else None
+                    )
+                    # 约 6~7s 的探索锁定（48Hz）
+                    self._l2_retreat_exclude_until_step = self._cur_step + 300
                 self._log("EXPLORE: retreat reached, resuming exploration")
                 # 继续执行下面逻辑，选新 frontier
             else:
-                return Command(target_pos=self._current_waypoint.copy(), target_rpy=rpy)
+                return Command(
+                    target_pos=self._explore_cmd_wp(self._current_waypoint),
+                    target_rpy=rpy,
+                )
 
         # 区域卡住：在同一片区域停留过久且仍有未发现目标 → 先试换 cluster，否则向起飞点撤退
         if self._region_retreat_until_step < 0:
@@ -227,6 +292,10 @@ class SearchMission(BaseMission):
                 and discovered_count < total
                 and dist_to_anchor < self._region_stuck_radius
                 and (replan_stuck or time_stuck)
+                and (
+                    not (self._l3_explore_hardening or self._l2_explore_hardening)
+                    or self._cur_step >= self._retreat_resume_block_until_step
+                )
             ):
                 center = self.planner.get_last_selected_cluster_center()
                 exclude_xy = center if center is not None else self._current_waypoint[:2]
@@ -243,7 +312,10 @@ class SearchMission(BaseMission):
                         self._region_replan_count = 0
                         self._reset_stuck_anchor(pos)
                         self._log(f"EXPLORE: region stuck, try other frontier → {wp_other.round(2)}")
-                        return Command(target_pos=wp_other, target_rpy=rpy)
+                        return Command(
+                            target_pos=self._explore_cmd_wp(wp_other),
+                            target_rpy=rpy,
+                        )
                 # 无其他区域或新航点仍在同片区域：向起飞点撤退
                 retreat_wp = self.planner.get_waypoint_towards_goal(
                     drone_pos=pos,
@@ -259,6 +331,8 @@ class SearchMission(BaseMission):
                         [retreat_xy[0], retreat_xy[1], self.takeoff_height],
                         dtype=float,
                     )
+                else:
+                    retreat_wp = self._explore_cmd_wp(retreat_wp)
                 self._current_waypoint = retreat_wp
                 self._region_retreat_until_step = self._cur_step + self._region_retreat_duration_steps
                 self._last_frontier_pick_step = self._cur_step
@@ -274,17 +348,30 @@ class SearchMission(BaseMission):
             if (not force_replan) and (
                 (self._cur_step - self._last_frontier_pick_step) < self.frontier_replan_cooldown_steps
             ):
-                return Command(target_pos=self._current_waypoint.copy(), target_rpy=rpy)
+                return Command(
+                    target_pos=self._explore_cmd_wp(self._current_waypoint),
+                    target_rpy=rpy,
+                )
 
             # 卡住时排除当前航点所在 cluster；同区域已重规划多次时也排除当前方向；刚撤退完也排除原 cluster 以换房间
             exclude = None
-            if self._just_finished_retreat:
+            if self._l2_explore_hardening and self._l2_retreat_exclude_center is not None:
+                if self._cur_step > self._l2_retreat_exclude_until_step:
+                    self._l2_retreat_exclude_center = None
+                    self._l2_retreat_exclude_until_step = -1
+                else:
+                    # 先硬性排除：离开房间后的锁定窗口内不回头选同一房间的 frontier
+                    exclude = self._l2_retreat_exclude_center
+            if exclude is None and self._just_finished_retreat:
                 center = self.planner.get_last_selected_cluster_center()
                 exclude = center if center is not None else self._current_waypoint[:2]
                 self._just_finished_retreat = False
-            elif force_replan or (
+            elif exclude is None and (
+                force_replan
+                or (
                 self._region_replan_count >= self._region_exclude_after_replans
                 and float(np.linalg.norm(pos[:2] - self._region_anchor_pos[:2])) <= self._region_stuck_radius
+                )
             ):
                 center = self.planner.get_last_selected_cluster_center()
                 exclude = center if center is not None else self._current_waypoint[:2]
@@ -300,6 +387,8 @@ class SearchMission(BaseMission):
             ):
                 dist_wp_to_anchor = float(np.linalg.norm(wp[:2] - self._region_anchor_pos[:2]))
                 if dist_wp_to_anchor < self._region_anchor_update_dist:
+                    if self._l3_explore_hardening or self._l2_explore_hardening or self._l1_explore_hardening:
+                        self._same_region_detour_count += 1
                     detour_wp = self.planner.get_waypoint_towards_goal(
                         drone_pos=pos,
                         goal_pos=self._home_pos[:2],
@@ -316,10 +405,84 @@ class SearchMission(BaseMission):
                             [step_back[0], step_back[1], self.takeoff_height],
                             dtype=float,
                         )
-                    self._log("EXPLORE: same region, detour toward home to exit")
+                    if self._l3_explore_hardening:
+                        if self._cur_step - self._last_detour_log_step >= 24:
+                            self._last_detour_log_step = self._cur_step
+                            self._log("EXPLORE: same region, detour toward home to exit")
+                    else:
+                        self._log("EXPLORE: same region, detour toward home to exit")
+
+                    if self._l3_explore_hardening or self._l2_explore_hardening or self._l1_explore_hardening:
+                        # anti-loop: repeated same-pocket detours -> force a side-step escape.
+                        if (
+                            self._same_region_detour_count
+                            >= self._same_region_detour_escape_threshold
+                        ):
+                            to_home = self._home_pos[:2] - pos[:2]
+                            n = float(np.linalg.norm(to_home))
+                            if n > 1e-9:
+                                u = to_home / n
+                                side = np.array([-u[1], u[0]], dtype=float)
+                                if (self._cur_step // 20) % 2 == 1:
+                                    side = -side
+                                forced_xy = pos[:2] + 1.0 * side + 0.5 * u
+                                forced_wp = self._clip_waypoint_to_safe(pos, forced_xy)
+                                min_move = 0.18 if self._l3_explore_hardening else 0.25
+                                if float(np.linalg.norm(forced_wp[:2] - pos[:2])) > min_move:
+                                    wp = forced_wp
+                                    self._same_region_detour_count = 0
+                                    self._log(
+                                        f"EXPLORE: anti-loop forced sidestep → {wp.round(2)}"
+                                    )
             if wp is not None:
+                wp = self._explore_cmd_wp(wp)
+                if self._l3_explore_hardening:
+                    if not force_replan:
+                        self._explore_identical_replan_count = 0
+                    if force_replan:
+                        d_prev = float(
+                            np.linalg.norm(wp[:2] - self._current_waypoint[:2])
+                        )
+                        if d_prev < 0.12:
+                            self._explore_identical_replan_count += 1
+                        else:
+                            self._explore_identical_replan_count = 0
+                        if self._explore_identical_replan_count >= 2:
+                            self._explore_identical_replan_count = 0
+                            home_wp = self.planner.get_waypoint_towards_goal(
+                                drone_pos=pos,
+                                goal_pos=self._home_pos[:2],
+                                lookahead_dist=1.5,
+                                goal_search_radius=1.5,
+                            )
+                            if home_wp is not None:
+                                wp = self._explore_cmd_wp(home_wp)
+                            else:
+                                pos_xy = pos[:2]
+                                h_xy = self._home_pos[:2]
+                                blend = pos_xy + 0.6 * (h_xy - pos_xy)
+                                wp = np.array(
+                                    [
+                                        blend[0],
+                                        blend[1],
+                                        self.takeoff_height,
+                                    ],
+                                    dtype=float,
+                                )
+                            self._log(
+                                "EXPLORE: stuck replan unchanged, force retreat toward home"
+                            )
                 if force_replan or float(np.linalg.norm(wp[:2] - self._current_waypoint[:2])) >= self.min_waypoint_delta:
                     self._current_waypoint = wp
+                    if self._l3_explore_hardening or self._l2_explore_hardening or self._l1_explore_hardening:
+                        # 仅在「新航点」已离开卡住口袋时清零绕路计数，避免 frontier↔绕 home 永振。
+                        dist_new_wp_to_region = float(
+                            np.linalg.norm(wp[:2] - self._region_anchor_pos[:2])
+                        )
+                        if dist_new_wp_to_region >= self._region_anchor_update_dist:
+                            self._same_region_detour_count = 0
+                    else:
+                        self._same_region_detour_count = 0
                     # 仅当飞机位置已离开当前区域（相对锚点移动 > 1.5m）时更新锚点，避免在房间内振荡时不断重置锚点
                     if float(np.linalg.norm(pos[:2] - self._region_anchor_pos[:2])) > self._region_anchor_update_dist:
                         self._region_anchor_pos = np.asarray(pos, dtype=float).copy()
@@ -340,7 +503,10 @@ class SearchMission(BaseMission):
                 if cmd is not None:
                     return cmd
 
-        return Command(target_pos=self._current_waypoint.copy(), target_rpy=rpy)
+        return Command(
+            target_pos=self._explore_cmd_wp(self._current_waypoint),
+            target_rpy=rpy,
+        )
 
     def _handle_goto_target(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
         if self._current_target_id is None:
@@ -691,25 +857,87 @@ class SearchMission(BaseMission):
                 self._log(f"Exploration done → GOTO_TARGET {tid}  pos={tpos.round(2)}")
                 return Command(target_pos=approach_wp, target_rpy=rpy)
 
-        # 无“已发现且未巡检”目标时，检查是否还有未发现的目标
-
-            # Target is known but currently unreachable: do NOT finish mission.
+            # 已发现未巡检但栅格路径暂不可达：保持 EXPLORE，用 frontier 尝试接近（勿在此结束任务）
             self._phase = _Phase.EXPLORE
             self._next_target_attempt_step = self._cur_step + self.target_retry_cooldown_steps
             self._current_target_id = tid
             self._current_target_pos = np.asarray(tpos, dtype=float).copy()
 
+            hold = np.array([pos[0], pos[1], self.takeoff_height], dtype=float)
+            _ur_log_period = 48  # ~1s @48Hz，仅 L3 用于节流
+
+            if (
+                (self._l3_explore_hardening or self._l2_explore_hardening)
+                and self._cur_step < self._unreachable_frontier_next_try_step
+            ):
+                if self._cur_step - self._last_unreachable_hold_log_step >= _ur_log_period:
+                    self._last_unreachable_hold_log_step = self._cur_step
+                    self._log(
+                        f"Exploration done, target {tid} unreachable (no frontier retry cooldown) -> HOLD"
+                    )
+                return Command(target_pos=hold, target_rpy=rpy)
+
             guided_wp = self._pick_frontier_towards(pos, tpos)
             if guided_wp is None:
                 guided_wp = self._pick_next_frontier(pos)
             if guided_wp is not None:
+                self._unreachable_frontier_next_try_step = -10**9
                 self._current_waypoint = guided_wp
                 self._last_frontier_pick_step = self._cur_step
-                self._log(f"Exploration done, target {tid} unreachable -> EXPLORE toward target")
-                return Command(target_pos=guided_wp, target_rpy=rpy)
+                if (not self._l3_explore_hardening) or (
+                    self._cur_step - self._last_unreachable_explore_log_step >= _ur_log_period
+                ):
+                    self._last_unreachable_explore_log_step = self._cur_step
+                    self._log(
+                        f"Exploration done, target {tid} unreachable -> EXPLORE toward target"
+                    )
+                out_wp = (
+                    self._explore_cmd_wp(guided_wp)
+                    if self._l3_explore_hardening
+                    else guided_wp
+                )
+                return Command(target_pos=out_wp, target_rpy=rpy)
 
-            hold = np.array([pos[0], pos[1], self.takeoff_height], dtype=float)
-            self._log(f"Exploration done, target {tid} unreachable and no frontier -> HOLD")
+            if self._l3_explore_hardening:
+                cd = min(120, max(48, self.target_retry_cooldown_steps // 3))
+                self._unreachable_frontier_next_try_step = self._cur_step + cd
+                if self._cur_step - self._last_unreachable_hold_log_step >= _ur_log_period:
+                    self._last_unreachable_hold_log_step = self._cur_step
+                    self._log(
+                        f"Exploration done, target {tid} unreachable and no frontier -> HOLD"
+                    )
+            else:
+                if self._l2_explore_hardening:
+                    # L2：unreachable && no frontier 时，继续 HOLD 原地容易卡在障碍接触/贴地状态触发坠毁；
+                    # 尝试先撤向 home，争取离开原口袋并让 frontier 再次出现。
+                    retreat_wp = self.planner.get_waypoint_towards_goal(
+                        drone_pos=pos,
+                        goal_pos=self._home_pos[:2],
+                        lookahead_dist=1.0,
+                        goal_search_radius=1.2,
+                    )
+                    if retreat_wp is not None:
+                        retreat_wp = np.asarray(retreat_wp, dtype=float).reshape(-1)
+                        if retreat_wp.size >= 3:
+                            retreat_wp[2] = float(self.takeoff_height)
+                        else:
+                            retreat_wp = np.array(
+                                [float(retreat_wp[0]), float(retreat_wp[1]), float(self.takeoff_height)],
+                                dtype=float,
+                            )
+                        return Command(target_pos=retreat_wp, target_rpy=rpy)
+
+                # L2 下该分支同样会在帧间反复进入；对该条日志节流，避免刷屏。
+                if self._l2_explore_hardening:
+                    if self._cur_step - self._last_unreachable_hold_log_step >= _ur_log_period:
+                        self._last_unreachable_hold_log_step = self._cur_step
+                        self._log(
+                            f"Exploration done, target {tid} unreachable and no frontier -> HOLD"
+                        )
+                else:
+                    self._log(
+                        f"Exploration done, target {tid} unreachable and no frontier -> HOLD"
+                    )
             return Command(target_pos=hold, target_rpy=rpy)
 
         inspected, discovered, total = self.target_manager.get_progress()
@@ -732,6 +960,16 @@ class SearchMission(BaseMission):
             # 仍有未发现目标：不悬停死等，向起飞点撤退一段，换位置后可能重新出现 frontier
             # 仅当当前不在撤退阶段时才发起新一轮撤退，避免每帧重置
             if self._region_retreat_until_step < 0 or self._cur_step >= self._region_retreat_until_step:
+                if (
+                    self._l3_explore_hardening
+                    and self._cur_step < self._retreat_resume_block_until_step
+                ):
+                    # 冷却期间不重复触发 retreat，维持当前探索航点
+                    self._phase = _Phase.EXPLORE
+                    return Command(
+                        target_pos=self._current_waypoint.copy(),
+                        target_rpy=rpy,
+                    )
                 retreat_wp = self.planner.get_waypoint_towards_goal(
                     drone_pos=pos,
                     goal_pos=self._home_pos[:2],
@@ -773,3 +1011,10 @@ class SearchMission(BaseMission):
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"[SearchMission] {msg}")
+
+    def _explore_cmd_wp(self, wp: np.ndarray) -> np.ndarray:
+        """L3：把 planner 路径点 z 拉到巡航高度；非 L3 保持原样（与历史行为一致）。"""
+        out = np.asarray(wp, dtype=float).copy().reshape(-1)
+        if self._l3_explore_hardening and out.size >= 3:
+            out[2] = float(self.takeoff_height)
+        return out
