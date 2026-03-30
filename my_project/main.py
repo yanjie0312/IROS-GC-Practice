@@ -1,4 +1,5 @@
 # my_project/main.py
+import os
 import time
 import numpy as np
 import pybullet as p
@@ -20,6 +21,8 @@ from my_project.navigation.frontier_planner import FrontierPlanner
 from my_project.navigation.avoidance import AvoidanceLayer
 from my_project.navigation.search_mission import SearchMission
 from my_project.navigation.mission_manager import MissionManager
+from my_project.utils.logging import EpisodeLogger
+from my_project.utils.metrics import compute_metrics, save_metrics_csv, save_run_config
 
 
 CRUISE_HEIGHT = 0.5    # 巡航高度（m），低于墙顶 1.0m
@@ -34,11 +37,21 @@ EXPLORED_OVERLAY_INTERVAL = 2   # 每 N 步更新一次
 
 def main():
     # 1) 创建场景 & 初始化 env
-    scenario = make_scenario(
-        CFG.get("difficulty_profile", "L0_easy"),
-        seed=int(CFG.get("scenario_seed", 42)),
-    )
-    profile_name = str(CFG.get("difficulty_profile", "L0_easy"))
+    _map_level = CFG.get("map_level")
+    _deg_level = CFG.get("deg_level")
+    if _map_level is not None and _deg_level is not None:
+        scenario = make_scenario(
+            map_level=str(_map_level),
+            deg_level=str(_deg_level),
+            seed=int(CFG.get("scenario_seed", 42)),
+        )
+        profile_name = str(CFG.get("difficulty_profile", f"{_map_level}+{_deg_level}"))
+    else:
+        scenario = make_scenario(
+            CFG.get("difficulty_profile", "L0_easy"),
+            seed=int(CFG.get("scenario_seed", 42)),
+        )
+        profile_name = str(CFG.get("difficulty_profile", "L0_easy"))
     # Hardening patch:
     # - L3: full hardening
     # - L2: light hardening (reduce stochastic crash probability)
@@ -59,7 +72,7 @@ def main():
         physics=CFG["physics"],
         pyb_freq=CFG["simulation_freq_hz"],
         ctrl_freq=CFG["control_freq_hz"],
-        gui=True,
+        gui=CFG.get("gui", True),
         obstacles=False,
     )
 
@@ -123,7 +136,7 @@ def main():
 
     # 4) 目标管理
     # 巡检判定是 3D 距离；L3 在保高度策略下常以 ~0.58m 悬停，
-    # 若 inspect_range 过小会出现“已发现但长期不完成巡检”的假卡死。
+    # 若 inspect_range 过小会出现"已发现但长期不完成巡检"的假卡死。
     inspect_range = 0.5
     if light_hardening_enabled:
         # L2/L3 都有保高度策略；巡检判定是 3D 距离，需要与悬停高度对齐
@@ -154,7 +167,7 @@ def main():
         verbose=True,
         waypoint_z=CRUISE_HEIGHT if hardening_enabled else None,
     )
-    # L3 下：对“目标被障碍半封堵”的情况更保守，避免 GOTO_TARGET<->EXPLORE 高频抖动
+    # L3 下：对"目标被障碍半封堵"的情况更保守，避免 GOTO_TARGET<->EXPLORE 高频抖动
     target_retry_cooldown_steps = 60
     goto_goal_search_radius = 1.40
     inspect_hover_dist = 0.4
@@ -163,7 +176,7 @@ def main():
         target_retry_cooldown_steps = 360   # 约 7.5s
         # 允许在目标周围更大范围找可达接近点，提升绕障成功率
         goto_goal_search_radius = 2.20
-        # 稍放宽“到达目标上方”判定，减少在障碍边缘贴墙逼近
+        # 稍放宽"到达目标上方"判定，减少在障碍边缘贴墙逼近
         inspect_hover_dist = 0.55
 
     mission = SearchMission(
@@ -221,9 +234,9 @@ def main():
     z_guard_target = CRUISE_HEIGHT + (0.06 if light_hardening_enabled and not hardening_enabled else 0.08)
     reduced_xy_step_scale = 0.72 if light_hardening_enabled and not hardening_enabled else 0.6
     # 近坠毁短恢复窗口：避免悬停末期瞬间掉高直接结束
-    # L2：曾出现低高度恢复窗口用尽仍无法拉起，导致误触发“坠毁退出”。
+    # L2：曾出现低高度恢复窗口用尽仍无法拉起，导致误触发"坠毁退出"。
     # 适当延长恢复窗口，给姿态恢复/脱离障碍更多时间。
-    # L2：拉长窗口；L3：也需要避免“trigger 后立刻坠毁”。
+    # L2：拉长窗口；L3：也需要避免"trigger 后立刻坠毁"。
     # L3：本轮在 low-z recovery 结束时仍未拉起，因此把 recovery 步数加大到 96，并提高触发提前量。
     # L2：恢复窗口很关键；L3：同样需要更长一点避免 trigger 后还没拉起来就触发坠毁
     # （low-z recovery 阶段同时会把目标 z 保到 0.70，并更强抑制横向机动）
@@ -241,7 +254,7 @@ def main():
     low_z_recovery_may_restart = True
     # L3：低空 recovery 若一直无法脱离（例如贴地/受力），允许最多再续航几轮
     low_z_recovery_restart_left = 2 if hardening_enabled else 0
-    # L2/L3：主循环层面的“局部卡死”检测与短时脱困
+    # L2/L3：主循环层面的"局部卡死"检测与短时脱困
     stuck_window = 72 if light_hardening_enabled and not hardening_enabled else 96   # 约 1.5s / 2.0s
     stuck_disp_thresh = 0.35 if light_hardening_enabled and not hardening_enabled else 0.28
     stuck_escape_steps = 30 if light_hardening_enabled and not hardening_enabled else 24
@@ -265,8 +278,49 @@ def main():
     last_i = 0
     last_t = 0.0
     last_pos = None
+    logger = EpisodeLogger()
     print("\n=== 任务开始 ===")
-    # 探索 overlay：在弹窗里用黄色点标出已探索区域（FREE），无 frontier 时多半是“已探完当前可见范围”但目标在未探到的地方）
+
+    # ── GUI HUD：右侧面板（debug parameter 滑条）+ 场景内文字 ──
+    _hud_text_ids = {}          # 场景内 debug text 句柄
+    _hud_update_interval = 5    # 每 N 控制步更新一次 HUD（避免性能开销）
+    if CFG.get("gui", True):
+        # 右侧面板：只读滑条显示关键指标
+        _slider_altitude = p.addUserDebugParameter("Altitude (m)", 0, 1.5, CRUISE_HEIGHT, physicsClientId=PYB_CLIENT)
+        _slider_min_dist = p.addUserDebugParameter("Min Obst Dist (m)", 0, 3.0, 3.0, physicsClientId=PYB_CLIENT)
+        _slider_targets_found = p.addUserDebugParameter("Targets Found", 0, 10, 0, physicsClientId=PYB_CLIENT)
+        _slider_targets_done = p.addUserDebugParameter("Targets Inspected", 0, 10, 0, physicsClientId=PYB_CLIENT)
+        _slider_speed = p.addUserDebugParameter("Speed (m/s)", 0, 2.0, 0, physicsClientId=PYB_CLIENT)
+        _slider_sim_time = p.addUserDebugParameter("Sim Time (s)", 0, MAX_DURATION_SEC, 0, physicsClientId=PYB_CLIENT)
+
+        # 场景固定位置的状态文字（左上角区域，使用世界坐标固定位置）
+        _hud_text_ids["phase"] = p.addUserDebugText(
+            "Phase: TAKEOFF", [0.0, -H_layout - 0.3, 1.2],
+            textColorRGB=[1, 1, 0], textSize=1.5, lifeTime=0,
+            physicsClientId=PYB_CLIENT,
+        )
+        _hud_text_ids["targets"] = p.addUserDebugText(
+            "Targets: 0/0 found  0/0 inspected", [0.0, -H_layout - 0.3, 1.05],
+            textColorRGB=[0.2, 1, 0.2], textSize=1.3, lifeTime=0,
+            physicsClientId=PYB_CLIENT,
+        )
+        _hud_text_ids["status"] = p.addUserDebugText(
+            f"Profile: {profile_name}  |  Budget: {MAX_DURATION_SEC}s", [0.0, -H_layout - 0.3, 0.90],
+            textColorRGB=[0.8, 0.8, 1.0], textSize=1.2, lifeTime=0,
+            physicsClientId=PYB_CLIENT,
+        )
+        _hud_text_ids["pos"] = p.addUserDebugText(
+            "Pos: (0.00, 0.00, 0.00)  Alt: 0.00m", [0.0, -H_layout - 0.3, 0.75],
+            textColorRGB=[0.9, 0.9, 0.9], textSize=1.1, lifeTime=0,
+            physicsClientId=PYB_CLIENT,
+        )
+        _hud_text_ids["safety"] = p.addUserDebugText(
+            "MinDist: --  Speed: --", [0.0, -H_layout - 0.3, 0.60],
+            textColorRGB=[0.9, 0.9, 0.9], textSize=1.1, lifeTime=0,
+            physicsClientId=PYB_CLIENT,
+        )
+
+    # 探索 overlay：在弹窗里用黄色点标出已探索区域（FREE），无 frontier 时多半是"已探完当前可见范围"但目标在未探到的地方）
     _explored_debug_id = None
 
     for i in range(1, steps + 1):
@@ -287,6 +341,7 @@ def main():
         last_i = i
         last_t = t
         last_pos = np.asarray(pkt["pos"], dtype=float).copy()
+        logger.record_step(pkt["pos"], pkt.get("min_dist", float("nan")))
 
         # 物理扰动注入（L0_easy 时输出零力）
         try:
@@ -297,6 +352,54 @@ def main():
         # 状态机 + 避障 → 目标点
         state = State(xyz=pkt["pos"], vel=pkt["vel"], step=i, t=t)
         cmd = manager.update(state, pkt)
+
+        # ── HUD 更新 ──
+        if CFG.get("gui", True) and (i % _hud_update_interval == 0):
+            try:
+                _inspected_h, _discovered_h, _total_h = target_manager.get_progress()
+                _phase_str = manager.mission.phase_name
+                _speed_val = float(np.linalg.norm(pkt["vel"]))
+                _min_d = float(pkt.get("min_dist", float("inf")))
+                _min_d_str = f"{_min_d:.2f}" if np.isfinite(_min_d) else "--"
+
+                # 任务阶段颜色：EXPLORE=绿, GOTO_TARGET=橙, INSPECT=青, DONE=白
+                _phase_colors = {
+                    "TAKEOFF": [1, 1, 0], "EXPLORE": [0.2, 1, 0.2],
+                    "GOTO_TARGET": [1, 0.6, 0], "INSPECT": [0, 1, 1],
+                    "DONE": [1, 1, 1],
+                }
+                _pc = _phase_colors.get(_phase_str, [1, 1, 0])
+
+                _hud_text_ids["phase"] = p.addUserDebugText(
+                    f"Phase: {_phase_str}", [0.0, -H_layout - 0.3, 1.2],
+                    textColorRGB=_pc, textSize=1.5, lifeTime=0,
+                    replaceItemUniqueId=int(_hud_text_ids.get("phase", -1)),
+                    physicsClientId=PYB_CLIENT,
+                )
+                _hud_text_ids["targets"] = p.addUserDebugText(
+                    f"Targets: {_discovered_h}/{_total_h} found  {_inspected_h}/{_total_h} inspected",
+                    [0.0, -H_layout - 0.3, 1.05],
+                    textColorRGB=[0.2, 1, 0.2], textSize=1.3, lifeTime=0,
+                    replaceItemUniqueId=int(_hud_text_ids.get("targets", -1)),
+                    physicsClientId=PYB_CLIENT,
+                )
+                _hud_text_ids["pos"] = p.addUserDebugText(
+                    f"Pos: ({pkt['pos'][0]:.2f}, {pkt['pos'][1]:.2f}, {pkt['pos'][2]:.2f})  Alt: {pkt['pos'][2]:.2f}m",
+                    [0.0, -H_layout - 0.3, 0.75],
+                    textColorRGB=[0.9, 0.9, 0.9], textSize=1.1, lifeTime=0,
+                    replaceItemUniqueId=int(_hud_text_ids.get("pos", -1)),
+                    physicsClientId=PYB_CLIENT,
+                )
+                _safe_color = [0.2, 1, 0.2] if (np.isfinite(_min_d) and _min_d > 0.3) else [1, 0.3, 0.3]
+                _hud_text_ids["safety"] = p.addUserDebugText(
+                    f"MinDist: {_min_d_str}m  Speed: {_speed_val:.2f}m/s  t={t:.1f}s",
+                    [0.0, -H_layout - 0.3, 0.60],
+                    textColorRGB=_safe_color, textSize=1.1, lifeTime=0,
+                    replaceItemUniqueId=int(_hud_text_ids.get("safety", -1)),
+                    physicsClientId=PYB_CLIENT,
+                )
+            except p.error:
+                pass
 
         # 在 PyBullet 窗口标出已探索区域（黄色 = 栅格 FREE，累积已探可通行区，非当前射线范围）。
         # 无 frontier 原因见下；目标发现需传感器本帧 LOS，与是否 FREE 无关。
@@ -350,7 +453,8 @@ def main():
                     escape_event_steps.append(i)
                     tag = "L3" if hardening_enabled else "L2"
                     print(f"[{tag}-escape] local stuck detected at t={t:.1f}s, disp={disp:.2f}m, steps={stuck_escape_remaining}")
-                    # 若短时间内反复触发，执行一次更大的“侧向脱困”目标，跳出门口/障碍边缘极小值
+                    logger.record_escape()
+                    # 若短时间内反复触发，执行一次更大的"侧向脱困"目标，跳出门口/障碍边缘极小值
                     recent_events = [s for s in escape_event_steps if (i - s) <= int(env.CTRL_FREQ * 12)]
                     if len(recent_events) >= 3:
                         ray_dists = np.asarray(pkt.get("ray_dists", []), dtype=float).reshape(-1)
@@ -509,6 +613,7 @@ def main():
                     print(
                         f"[{tag}-recovery] low-z trigger at t={t:.1f}s, z={z:.2f}, steps={low_z_recovery_remaining}"
                     )
+                    logger.record_low_z()
 
         if light_hardening_enabled and low_z_recovery_remaining > 0 and not cmd.finished:
             # 保高度 + 极小横向步长，给姿态恢复时间
@@ -614,6 +719,13 @@ def main():
     }
     print("\n=== 评估结果 (result) ===")
     print(result)
+
+    # --- Save outputs ---
+    out_dir = str(CFG.get("output_folder", "results"))
+    save_run_config(os.path.join(out_dir, "run_config.json"), CFG, scenario)
+    metrics = compute_metrics(logger, result, scenario, CFG)
+    save_metrics_csv(os.path.join(out_dir, "metrics.csv"), metrics)
+    print(f"\n[output] run_config.json + metrics.csv → {out_dir}/")
 
     try:
         env.close()

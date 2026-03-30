@@ -183,6 +183,11 @@ class SearchMission(BaseMission):
         self.planner.reset()
         self._log(f"reset → TAKEOFF  home={self._home_pos.round(2)}")
 
+    @property
+    def phase_name(self) -> str:
+        """Return current mission phase name as string."""
+        return self._phase.name
+
     def update(self, state: State, sensors: dict) -> Command:
         self._cur_step = int(state.step)
         pos = np.asarray(state.xyz, dtype=float)
