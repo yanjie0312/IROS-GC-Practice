@@ -1,4 +1,5 @@
 # my_project/main.py
+import os
 import time
 import numpy as np
 import pybullet as p
@@ -20,6 +21,8 @@ from my_project.navigation.frontier_planner import FrontierPlanner
 from my_project.navigation.avoidance import AvoidanceLayer
 from my_project.navigation.search_mission import SearchMission
 from my_project.navigation.mission_manager import MissionManager
+from my_project.utils.logging import EpisodeLogger
+from my_project.utils.metrics import compute_metrics, save_metrics_csv, save_run_config
 
 
 CRUISE_HEIGHT = 0.5    # 巡航高度（m），低于墙顶 1.0m
@@ -265,6 +268,7 @@ def main():
     last_i = 0
     last_t = 0.0
     last_pos = None
+    logger = EpisodeLogger()
     print("\n=== 任务开始 ===")
     # 探索 overlay：在弹窗里用黄色点标出已探索区域（FREE），无 frontier 时多半是“已探完当前可见范围”但目标在未探到的地方）
     _explored_debug_id = None
@@ -287,6 +291,7 @@ def main():
         last_i = i
         last_t = t
         last_pos = np.asarray(pkt["pos"], dtype=float).copy()
+        logger.record_step(pkt["pos"], pkt.get("min_dist", float("nan")))
 
         # 物理扰动注入（L0_easy 时输出零力）
         try:
@@ -350,6 +355,7 @@ def main():
                     escape_event_steps.append(i)
                     tag = "L3" if hardening_enabled else "L2"
                     print(f"[{tag}-escape] local stuck detected at t={t:.1f}s, disp={disp:.2f}m, steps={stuck_escape_remaining}")
+                    logger.record_escape()
                     # 若短时间内反复触发，执行一次更大的“侧向脱困”目标，跳出门口/障碍边缘极小值
                     recent_events = [s for s in escape_event_steps if (i - s) <= int(env.CTRL_FREQ * 12)]
                     if len(recent_events) >= 3:
@@ -509,6 +515,7 @@ def main():
                     print(
                         f"[{tag}-recovery] low-z trigger at t={t:.1f}s, z={z:.2f}, steps={low_z_recovery_remaining}"
                     )
+                    logger.record_low_z()
 
         if light_hardening_enabled and low_z_recovery_remaining > 0 and not cmd.finished:
             # 保高度 + 极小横向步长，给姿态恢复时间
@@ -614,6 +621,13 @@ def main():
     }
     print("\n=== 评估结果 (result) ===")
     print(result)
+
+    # --- Save outputs ---
+    out_dir = str(CFG.get("output_folder", "results"))
+    save_run_config(os.path.join(out_dir, "run_config.json"), CFG, scenario)
+    metrics = compute_metrics(logger, result, scenario, CFG)
+    save_metrics_csv(os.path.join(out_dir, "metrics.csv"), metrics)
+    print(f"\n[output] run_config.json + metrics.csv → {out_dir}/")
 
     try:
         env.close()
