@@ -37,11 +37,21 @@ EXPLORED_OVERLAY_INTERVAL = 2   # 每 N 步更新一次
 
 def main():
     # 1) 创建场景 & 初始化 env
-    scenario = make_scenario(
-        CFG.get("difficulty_profile", "L0_easy"),
-        seed=int(CFG.get("scenario_seed", 42)),
-    )
-    profile_name = str(CFG.get("difficulty_profile", "L0_easy"))
+    _map_level = CFG.get("map_level")
+    _deg_level = CFG.get("deg_level")
+    if _map_level is not None and _deg_level is not None:
+        scenario = make_scenario(
+            map_level=str(_map_level),
+            deg_level=str(_deg_level),
+            seed=int(CFG.get("scenario_seed", 42)),
+        )
+        profile_name = str(CFG.get("difficulty_profile", f"{_map_level}+{_deg_level}"))
+    else:
+        scenario = make_scenario(
+            CFG.get("difficulty_profile", "L0_easy"),
+            seed=int(CFG.get("scenario_seed", 42)),
+        )
+        profile_name = str(CFG.get("difficulty_profile", "L0_easy"))
     # Hardening patch:
     # - L3: full hardening
     # - L2: light hardening (reduce stochastic crash probability)
@@ -62,7 +72,7 @@ def main():
         physics=CFG["physics"],
         pyb_freq=CFG["simulation_freq_hz"],
         ctrl_freq=CFG["control_freq_hz"],
-        gui=True,
+        gui=CFG.get("gui", True),
         obstacles=False,
     )
 
