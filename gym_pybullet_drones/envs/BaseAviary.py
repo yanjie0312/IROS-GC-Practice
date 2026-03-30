@@ -147,7 +147,8 @@ class BaseAviary(gym.Env):
         #### Connect to PyBullet ###################################
         if self.GUI:
             #### With debug GUI ########################################
-            self.CLIENT = p.connect(p.GUI) # p.connect(p.GUI, options="--opengl2")
+            # self.CLIENT = p.connect(p.GUI, options="--opengl2")
+            self.CLIENT = p.connect(p.GUI, options="--opengl3")
             # Enable RGB preview in the left panel; disable depth and segmentation
             p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 1, physicsClientId=self.CLIENT)
             for i in [p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW]:
