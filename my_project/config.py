@@ -4,7 +4,7 @@ from gym_pybullet_drones.utils.enums import DroneModel, Physics
 CFG = {
     "drone": DroneModel("cf2x"),
     "num_drones": 1,
-    "physics": Physics("pyb"),
+    "physics": Physics("pyb"), 
     "gui": True,
     "record_video": False,
     "plot": False,

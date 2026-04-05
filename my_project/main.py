@@ -1,4 +1,5 @@
 # my_project/main.py
+import argparse
 import os
 import time
 import numpy as np
@@ -648,4 +649,25 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--profile",
+        default=None,
+        choices=["L0_easy", "L1_mild", "L2_medium", "L3_hard"],
+        help="Difficulty profile (overrides config.py)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Random seed (overrides config.py)"
+    )
+    parser.add_argument(
+        "--no-gui", action="store_true", help="Disable PyBullet GUI"
+    )
+    args = parser.parse_args()
+    if args.profile is not None:
+        CFG["difficulty_profile"] = args.profile
+        CFG["output_folder"] = os.path.join("results", args.profile)
+    if args.seed is not None:
+        CFG["scenario_seed"] = args.seed
+    if args.no_gui:
+        CFG["gui"] = False
     r = main()
