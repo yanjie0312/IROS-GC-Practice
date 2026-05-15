@@ -1,11 +1,14 @@
 # my_project/main.py
 import os
+import json
 import time
 import numpy as np
 import pybullet as p
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 from collections import deque
+from datetime import datetime
 
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.utils.utils import sync
@@ -35,85 +38,239 @@ EXPLORED_OVERLAY_INTERVAL = 2   # 每 N 步更新一次
 # 黄色含义：栅格 FREE = 射线曾穿过该格（累积地图），不是「当前射线范围」。
 # 另一房间有黄 = 曾到过该房或 2D 投影下射线经门洞穿过。目标「已发现」= 本帧传感器 LOS，与 FREE 无关。
 
-def _plot_flight_result(
+def _get_wall_draw_segments(layout: dict) -> list:
+    """将 layout 的 outer/inner 墙段扣除门洞后，返回可直接绘制的线段列表 [(x1,y1,x2,y2),...]。"""
+    outer = layout["outer"]
+    inner = layout["inner"]
+    gap_map: dict = {}
+    for which, idx, center, width in layout.get("gaps", []):
+        gap_map.setdefault((which, idx), []).append((center, width))
+
+    segs = []
+    for which, wall_list in (("outer", outer), ("inner", inner)):
+        for idx, (x1, y1, x2, y2) in enumerate(wall_list):
+            gaps = gap_map.get((which, idx), [])
+            if not gaps:
+                segs.append((x1, y1, x2, y2))
+                continue
+            is_vert = abs(x2 - x1) < 1e-6
+            if is_vert:
+                lo, hi = sorted([y1, y2])
+                cuts = sorted((c - w / 2, c + w / 2) for c, w in gaps)
+                cur = lo
+                for gs, ge in cuts:
+                    if cur < gs:
+                        segs.append((x1, cur, x1, min(gs, hi)))
+                    cur = max(cur, ge)
+                if cur < hi:
+                    segs.append((x1, cur, x1, hi))
+            else:
+                lo, hi = sorted([x1, x2])
+                cuts = sorted((c - w / 2, c + w / 2) for c, w in gaps)
+                cur = lo
+                for gs, ge in cuts:
+                    if cur < gs:
+                        segs.append((cur, y1, min(gs, hi), y1))
+                    cur = max(cur, ge)
+                if cur < hi:
+                    segs.append((cur, y1, hi, y1))
+    return segs
+
+
+def _draw_trajectory(ax, trajectory: list) -> None:
+    """在 ax 上画渐深蓝色轨迹。"""
+    if not trajectory:
+        return
+    traj = np.array(trajectory)
+    n = len(traj)
+    for i in range(n - 1):
+        alpha = 0.3 + 0.7 * i / max(n - 1, 1)
+        ax.plot(traj[i:i+2, 0], traj[i:i+2, 1], "-",
+                color="royalblue", alpha=alpha, linewidth=1.0)
+    ax.plot(traj[-1, 0], traj[-1, 1], "s",
+            color="crimson", markersize=8, zorder=6)
+
+
+def _save_flight_data(
+    base_path: str,
     trajectory: list,
     grid: OccupancyGrid,
-    target_manager: "TargetManager",
+    target_manager,
+    targets_gt: dict,
+    obstacles_gt: list,
+    nofly_gt: list,
     home_pos: np.ndarray,
     result: dict,
-    save_path: str = "results/trajectory.png",
+    layout: dict,
 ) -> None:
-    """飞行结束后生成俯视轨迹图，保存到文件。"""
-    fig, ax = plt.subplots(figsize=(13, 13))
+    """将飞行数据保存为 JSON，与图片同名不同后缀。"""
+    b = grid.bounds
+    data = {
+        "result": result,
+        "trajectory_xy": [pt.tolist() for pt in trajectory],
+        "home_pos": home_pos[:3].tolist(),
+        "occupancy_grid": {
+            "resolution": float(grid.resolution),
+            "bounds": {"x_min": b.x_min, "x_max": b.x_max,
+                       "y_min": b.y_min, "y_max": b.y_max},
+            "data": grid.grid.tolist(),
+        },
+        "targets": [
+            {
+                "id": int(tid),
+                "discovered": bool(info.discovered),
+                "inspected": bool(info.inspected),
+                "estimated_pos": info.position.tolist(),
+                "true_pos": targets_gt.get(int(tid)),
+                "measured_pos_at_inspect": (
+                    info.measured_position_at_inspect.tolist()
+                    if info.measured_position_at_inspect is not None else None
+                ),
+            }
+            for tid, info in target_manager.targets.items()
+        ],
+        "obstacles_true_pos": obstacles_gt,
+        "nofly_true_pos": nofly_gt,
+        "layout": {
+            "outer": layout["outer"],
+            "inner": layout["inner"],
+            "gaps": [list(g) for g in layout.get("gaps", [])],
+        },
+    }
+    json_path = base_path + ".json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    print(f"[Data]  saved → {json_path}")
 
-    # 占据栅格背景：UNKNOWN=浅灰，FREE=米白，OCCUPIED=深色
-    g = grid.grid
-    rgb = np.ones((*g.shape, 3), dtype=float) * 0.82       # 默认灰（UNKNOWN）
-    rgb[g == FREE]     = [0.97, 0.97, 0.88]                 # FREE：米白
-    rgb[g == OCCUPIED] = [0.22, 0.22, 0.22]                 # OCCUPIED：深灰
+
+def _plot_flight_result(
+    base_path: str,
+    trajectory: list,
+    grid: OccupancyGrid,
+    target_manager,
+    targets_gt: dict,
+    obstacles_gt: list,
+    nofly_gt: list,
+    home_pos: np.ndarray,
+    result: dict,
+    layout: dict,
+) -> None:
+    """生成左（无人机感知）右（上帝视角）双面板对比图，保存为 PNG。"""
+    fig, axes = plt.subplots(1, 2, figsize=(22, 11))
     b = grid.bounds
     extent = [b.x_min, b.x_max, b.y_min, b.y_max]
+
+    # ── 左面板：无人机感知视角 ────────────────────────────────────────
+    ax = axes[0]
+    g = grid.grid
+    rgb = np.ones((*g.shape, 3), dtype=float) * 0.82
+    rgb[g == FREE]     = [0.97, 0.97, 0.88]
+    rgb[g == OCCUPIED] = [0.22, 0.22, 0.22]
     ax.imshow(rgb, origin="lower", extent=extent, aspect="equal", interpolation="nearest")
-
-    # 轨迹（蓝色渐深，越晚越深）
-    if trajectory:
-        traj = np.array(trajectory)
-        n = len(traj)
-        for i in range(n - 1):
-            alpha = 0.3 + 0.7 * i / max(n - 1, 1)
-            ax.plot(traj[i:i+2, 0], traj[i:i+2, 1], "-",
-                    color="royalblue", alpha=alpha, linewidth=1.0)
-        ax.plot(traj[-1, 0], traj[-1, 1], "s",
-                color="crimson", markersize=9, zorder=6, label="终点")
-
-    # 起飞点
-    ax.plot(home_pos[0], home_pos[1], "^",
-            color="limegreen", markersize=14, zorder=7,
-            markeredgecolor="darkgreen", markeredgewidth=1.2, label="起飞点/Home")
-
-    # 目标点
+    _draw_trajectory(ax, trajectory)
+    ax.plot(home_pos[0], home_pos[1], "^", color="limegreen", markersize=13,
+            zorder=7, markeredgecolor="darkgreen", markeredgewidth=1.2)
     for tid, info in target_manager.targets.items():
         pos = info.position
         if np.linalg.norm(pos) < 1e-6:
             continue
         if info.inspected:
-            ax.plot(pos[0], pos[1], "*", color="gold", markersize=20, zorder=8,
+            ax.plot(pos[0], pos[1], "*", color="gold", markersize=18, zorder=8,
                     markeredgecolor="darkorange", markeredgewidth=1.5)
-            ax.annotate(f"T{tid} ✓", (pos[0], pos[1]),
-                        xytext=(6, 6), textcoords="offset points",
-                        fontsize=9, color="darkorange", fontweight="bold")
+            ax.annotate(f"T{tid} OK", (pos[0], pos[1]), xytext=(5, 5),
+                        textcoords="offset points", fontsize=8,
+                        color="darkorange", fontweight="bold")
         elif info.discovered:
-            ax.plot(pos[0], pos[1], "*", color="orange", markersize=16, zorder=8,
+            ax.plot(pos[0], pos[1], "*", color="orange", markersize=15, zorder=8,
                     markeredgecolor="saddlebrown", markeredgewidth=1.2)
-            ax.annotate(f"T{tid}", (pos[0], pos[1]),
-                        xytext=(6, 6), textcoords="offset points",
-                        fontsize=9, color="saddlebrown")
+            ax.annotate(f"T{tid}", (pos[0], pos[1]), xytext=(5, 5),
+                        textcoords="offset points", fontsize=8, color="saddlebrown")
+    ax.set_title("Drone Perception\n(gray=unknown, cream=explored, dark=wall/obstacle)",
+                 fontsize=11, fontweight="bold")
+    ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
+    ax.grid(True, alpha=0.2, linestyle="--")
 
-    # 标题与坐标轴
-    status = "成功" if result["success"] else result["termination_reason"]
-    ax.set_title(
-        f"飞行结果: {status}  |  用时: {result['flight_time_sec']:.1f}s  |  "
-        f"巡检: {result['targets_inspected']}/{result['targets_total']} 个目标",
-        fontsize=13, fontweight="bold",
-    )
-    ax.set_xlabel("X (m)")
-    ax.set_ylabel("Y (m)")
-    ax.grid(True, alpha=0.25, linestyle="--")
+    # ── Right panel: ground truth ─────────────────────────────────
+    ax2 = axes[1]
+    ax2.set_facecolor("#f5f5f0")
+    ax2.set_xlim(b.x_min - 0.3, b.x_max + 0.3)
+    ax2.set_ylim(b.y_min - 0.3, b.y_max + 0.3)
+    ax2.set_aspect("equal")
 
+    # 禁飞区
+    for pos in nofly_gt:
+        circ = mpatches.Circle(pos, radius=0.45, color="tomato", alpha=0.25, zorder=1)
+        ax2.add_patch(circ)
+
+    # 墙壁（带门洞）
+    wall_segs = _get_wall_draw_segments(layout)
+    for x1, y1, x2, y2 in wall_segs:
+        ax2.plot([x1, x2], [y1, y2], "-", color="#333333", linewidth=2.5, zorder=3)
+
+    # 障碍物
+    for pos in obstacles_gt:
+        circ = mpatches.Circle(pos, radius=0.22, color="slategray", alpha=0.7, zorder=4)
+        ax2.add_patch(circ)
+
+    # 真实目标位置
+    for tid, info in target_manager.targets.items():
+        gt_pos = targets_gt.get(int(tid))
+        if gt_pos is None:
+            continue
+        if info.inspected:
+            ax2.plot(gt_pos[0], gt_pos[1], "*", color="gold", markersize=18,
+                     zorder=8, markeredgecolor="darkorange", markeredgewidth=1.5)
+            ax2.annotate(f"T{tid} OK", (gt_pos[0], gt_pos[1]), xytext=(5, 5),
+                         textcoords="offset points", fontsize=8,
+                         color="darkorange", fontweight="bold")
+        elif info.discovered:
+            ax2.plot(gt_pos[0], gt_pos[1], "*", color="orange", markersize=15,
+                     zorder=8, markeredgecolor="saddlebrown", markeredgewidth=1.2)
+            ax2.annotate(f"T{tid}", (gt_pos[0], gt_pos[1]), xytext=(5, 5),
+                         textcoords="offset points", fontsize=8, color="saddlebrown")
+        else:
+            ax2.plot(gt_pos[0], gt_pos[1], "*", color="lightgray", markersize=15,
+                     zorder=8, markeredgecolor="gray", markeredgewidth=1.0)
+
+    # 轨迹与起点
+    _draw_trajectory(ax2, trajectory)
+    ax2.plot(home_pos[0], home_pos[1], "^", color="limegreen", markersize=13,
+             zorder=9, markeredgecolor="darkgreen", markeredgewidth=1.2)
+
+    ax2.set_title("Ground Truth\n(true walls, obstacles, target positions)",
+                  fontsize=11, fontweight="bold")
+    ax2.set_xlabel("X (m)"); ax2.set_ylabel("Y (m)")
+    ax2.grid(True, alpha=0.2, linestyle="--")
+
+    # ── 共用图例 ─────────────────────────────────────────────────────
     legend_elements = [
-        Line2D([0], [0], color="royalblue", linewidth=2, label="飞行轨迹"),
-        Line2D([0], [0], marker="^", color="limegreen", markersize=11,
-               linestyle="None", markeredgecolor="darkgreen", label="起飞点/Home"),
-        Line2D([0], [0], marker="*", color="gold", markersize=13,
-               linestyle="None", markeredgecolor="darkorange", label="已巡检目标"),
-        Line2D([0], [0], marker="*", color="orange", markersize=12,
-               linestyle="None", markeredgecolor="saddlebrown", label="已发现未巡检"),
+        Line2D([0], [0], color="royalblue", linewidth=2, label="Trajectory"),
+        Line2D([0], [0], marker="^", color="limegreen", markersize=10,
+               linestyle="None", markeredgecolor="darkgreen", label="Home"),
+        Line2D([0], [0], marker="*", color="gold", markersize=12,
+               linestyle="None", markeredgecolor="darkorange", label="Inspected target"),
+        Line2D([0], [0], marker="*", color="orange", markersize=11,
+               linestyle="None", markeredgecolor="saddlebrown", label="Discovered (not inspected)"),
+        Line2D([0], [0], marker="*", color="lightgray", markersize=11,
+               linestyle="None", markeredgecolor="gray", label="Undiscovered target (right)"),
+        mpatches.Patch(color="slategray", alpha=0.7, label="Obstacle (right)"),
+        mpatches.Patch(color="tomato",    alpha=0.25, label="No-fly zone (right)"),
     ]
-    ax.legend(handles=legend_elements, loc="upper right", fontsize=9)
+    fig.legend(handles=legend_elements, loc="lower center", ncol=4,
+               fontsize=9, bbox_to_anchor=(0.5, 0.01))
 
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"\n[Plot] 轨迹图已保存 → {save_path}")
+    status = "SUCCESS" if result["success"] else result["termination_reason"]
+    fig.suptitle(
+        f"Result: {status}  |  Time: {result['flight_time_sec']:.1f}s  |  "
+        f"Inspected: {result['targets_inspected']}/{result['targets_total']} targets",
+        fontsize=13, fontweight="bold", y=0.99,
+    )
+    fig.tight_layout(rect=[0, 0.06, 1, 0.97])
+
+    img_path = base_path + ".png"
+    os.makedirs(os.path.dirname(os.path.abspath(img_path)), exist_ok=True)
+    fig.savefig(img_path, dpi=150, bbox_inches="tight")
+    print(f"[Plot]  saved → {img_path}")
     plt.close(fig)
 
 
@@ -133,7 +290,21 @@ def main():
     l2_enabled = profile_name.startswith("L2")
     layout = get_layout(scenario.layout_name)
 
-    INIT_XYZS = np.array([[0.5, 0.0, CFG["flight_height"]]])
+    # 从 layout 的入口 gap 计算起飞点（门洞内侧 0.3m）
+    _entrance = next(
+        (g for g in layout.get("gaps", []) if g[0] == "outer"), None
+    )
+    if _entrance is not None:
+        _which, _idx, _center, _width = _entrance
+        _wx1, _wy1, _wx2, _wy2 = layout["outer"][_idx]
+        if abs(_wx2 - _wx1) < 1e-6:          # 竖墙：门中心是 y_center
+            _sx, _sy = _wx1 + 0.3, float(_center)
+        else:                                  # 横墙：门中心是 x_center
+            _sx, _sy = float(_center), _wy1 + 0.3
+    else:
+        _sx, _sy = 0.3, 0.0
+
+    INIT_XYZS = np.array([[_sx, _sy, CFG["flight_height"]]])
     INIT_RPYS = np.array([[0.0, 0.0, 0.0]])
 
     env = CtrlAviary(
@@ -713,18 +884,52 @@ def main():
     print("\n=== 评估结果 (result) ===")
     print(result)
 
+    # 关闭仿真前收集真实坐标（env.close() 后 PyBullet 连接断开）
+    obstacles_gt, nofly_gt, targets_gt = [], [], {}
+    try:
+        for oid in arena_handle.get("obstacle_ids", []):
+            pos, _ = p.getBasePositionAndOrientation(oid, physicsClientId=PYB_CLIENT)
+            obstacles_gt.append([float(pos[0]), float(pos[1])])
+        for nid in arena_handle.get("nofly_ids", []):
+            pos, _ = p.getBasePositionAndOrientation(nid, physicsClientId=PYB_CLIENT)
+            nofly_gt.append([float(pos[0]), float(pos[1])])
+        for tid in arena_handle.get("target_ids", []):
+            pos, _ = p.getBasePositionAndOrientation(tid, physicsClientId=PYB_CLIENT)
+            targets_gt[int(tid)] = [float(pos[0]), float(pos[1]), float(pos[2])]
+    except p.error:
+        pass
+
     try:
         env.close()
     except p.error:
         pass
 
-    _plot_flight_result(
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_path = os.path.join(str(CFG.get("output_folder", "results")), f"run_{ts}")
+
+    _save_flight_data(
+        base_path=base_path,
         trajectory=trajectory,
         grid=grid,
         target_manager=target_manager,
+        targets_gt=targets_gt,
+        obstacles_gt=obstacles_gt,
+        nofly_gt=nofly_gt,
         home_pos=np.array(INIT_XYZS[0], dtype=float),
         result=result,
-        save_path=str(CFG.get("output_folder", "results")) + "/trajectory.png",
+        layout=layout,
+    )
+    _plot_flight_result(
+        base_path=base_path,
+        trajectory=trajectory,
+        grid=grid,
+        target_manager=target_manager,
+        targets_gt=targets_gt,
+        obstacles_gt=obstacles_gt,
+        nofly_gt=nofly_gt,
+        home_pos=np.array(INIT_XYZS[0], dtype=float),
+        result=result,
+        layout=layout,
     )
 
     return result

@@ -683,7 +683,7 @@ class SearchMission(BaseMission):
     def _handle_done(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
         home = self._home_pos.copy()
         dist = float(np.linalg.norm(pos - home))
-        finished = dist < 1.0
+        finished = dist < self.waypoint_reach_dist
         if finished:
             if self._enable_delivery:
                 queue = self._build_delivery_queue()
