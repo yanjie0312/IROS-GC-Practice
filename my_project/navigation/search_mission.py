@@ -18,6 +18,7 @@ class _Phase(Enum):
     GOTO_TARGET = auto()
     INSPECT = auto()
     DONE = auto()
+    DELIVER = auto()
 
 
 class SearchMission(BaseMission):
@@ -56,6 +57,8 @@ class SearchMission(BaseMission):
         l1_explore_hardening: bool = False,
         l2_explore_hardening: bool = False,
         l3_explore_hardening: bool = False,
+        enable_delivery: bool = False,
+        deliver_hover_secs: float = 2.0,
         verbose: bool = True,
     ):
         """
@@ -147,6 +150,14 @@ class SearchMission(BaseMission):
         # L2：retreat 离开一个房间后，短时间内禁止重新选回同一房间 frontier
         self._l2_retreat_exclude_center: np.ndarray | None = None
         self._l2_retreat_exclude_until_step: int = -1
+        # 房间退出：当前区域无 frontier 时主动朝全局 frontier 导航
+        self._room_exit_cooldown_step: int = -1
+        # 投递阶段
+        self._enable_delivery: bool = bool(enable_delivery)
+        self._deliver_hover_secs: float = float(deliver_hover_secs)
+        self._deliver_queue: list = []
+        self._deliver_current_idx: int = 0
+        self._deliver_hover_remaining: int = 0
     # ------------------------------------------------------------------
 
     def reset(self, state: State) -> None:
@@ -180,6 +191,10 @@ class SearchMission(BaseMission):
         self._last_unreachable_hold_log_step = -10**9
         self._l2_retreat_exclude_center = None
         self._l2_retreat_exclude_until_step = -1
+        self._room_exit_cooldown_step = -1
+        self._deliver_queue = []
+        self._deliver_current_idx = 0
+        self._deliver_hover_remaining = 0
         self.planner.reset()
         self._log(f"reset → TAKEOFF  home={self._home_pos.round(2)}")
 
@@ -199,6 +214,8 @@ class SearchMission(BaseMission):
             return self._handle_goto_target(pos, zero_rpy)
         elif self._phase == _Phase.INSPECT:
             return self._handle_inspect(pos, zero_rpy)
+        elif self._phase == _Phase.DELIVER:
+            return self._handle_deliver(pos, zero_rpy)
         else:  # DONE
             return self._handle_done(pos, zero_rpy)
 
@@ -353,6 +370,27 @@ class SearchMission(BaseMission):
                     target_rpy=rpy,
                 )
 
+            # 所有 frontier 中心都较远（>2m）→ 当前房间已基本探索完，主动出房间
+            centers = self.planner.get_frontier_centers()
+            if centers and self._cur_step >= self._room_exit_cooldown_step:
+                nearest_center_dist = min(
+                    float(np.linalg.norm(np.asarray(c[:2], dtype=float) - pos[:2]))
+                    for c in centers
+                )
+                if nearest_center_dist > 2.0:
+                    exit_wp = self._navigate_toward_global_frontier(pos)
+                    if exit_wp is not None and float(np.linalg.norm(exit_wp[:2] - pos[:2])) > 0.15:
+                        self._current_waypoint = exit_wp
+                        self._room_exit_cooldown_step = self._cur_step + 60
+                        self._log(
+                            f"EXPLORE: all frontiers far ({nearest_center_dist:.1f}m), "
+                            f"room exit → {exit_wp.round(2)}"
+                        )
+                        return Command(
+                            target_pos=self._explore_cmd_wp(exit_wp),
+                            target_rpy=rpy,
+                        )
+
             # 卡住时排除当前航点所在 cluster；同区域已重规划多次时也排除当前方向；刚撤退完也排除原 cluster 以换房间
             exclude = None
             if self._l2_explore_hardening and self._l2_retreat_exclude_center is not None:
@@ -498,6 +536,18 @@ class SearchMission(BaseMission):
                 if force_replan:
                     self._reset_stuck_anchor(pos)
             else:
+                # 当前位置无可达 frontier，但全局有 frontier → 主动出房间
+                if self.planner.get_frontier_centers():
+                    if self._cur_step >= self._room_exit_cooldown_step:
+                        exit_wp = self._navigate_toward_global_frontier(pos)
+                        if exit_wp is not None:
+                            self._current_waypoint = exit_wp
+                            self._room_exit_cooldown_step = self._cur_step + 60
+                            self._log(f"EXPLORE: room exit → global frontier {exit_wp.round(2)}")
+                            return Command(
+                                target_pos=self._explore_cmd_wp(exit_wp),
+                                target_rpy=rpy,
+                            )
                 # 没有更多 frontier，探索结束
                 cmd = self._try_transition_to_target_or_done(pos, rpy)
                 if cmd is not None:
@@ -635,11 +685,20 @@ class SearchMission(BaseMission):
         dist = float(np.linalg.norm(pos - home))
         finished = dist < 1.0
         if finished:
+            if self._enable_delivery:
+                queue = self._build_delivery_queue()
+                if queue:
+                    self._deliver_queue = queue
+                    self._deliver_current_idx = 0
+                    self._deliver_hover_remaining = 0
+                    self._phase = _Phase.DELIVER
+                    self._log(f"DONE: arrived home → DELIVER ({len(queue)} targets)")
+                    return Command(target_pos=home, target_rpy=rpy, finished=False, info="delivery_start")
             self._log("DONE: returned home, mission complete")
             return Command(
                 target_pos=home,
                 target_rpy=rpy,
-                finished=finished,
+                finished=True,
                 info="mission_done",
             )
 
@@ -1007,6 +1066,109 @@ class SearchMission(BaseMission):
     def _reset_stuck_anchor(self, pos: np.ndarray) -> None:
         self._stuck_anchor_pos = np.asarray(pos, dtype=float).copy()
         self._stuck_anchor_step = self._cur_step
+
+    def _navigate_toward_global_frontier(self, pos: np.ndarray) -> Optional[np.ndarray]:
+        """当前区域无可达 frontier 时，用较大 lookahead 朝最近的全局 frontier 中心导航。"""
+        centers = self.planner.get_frontier_centers()
+        if not centers:
+            return None
+        pos_xy = np.asarray(pos[:2], dtype=float)
+        best_wp = None
+        best_dist = float("inf")
+        for center in centers:
+            center_xy = np.asarray(center[:2], dtype=float)
+            wp = self.planner.get_waypoint_towards_goal(
+                drone_pos=pos,
+                goal_pos=center_xy,
+                lookahead_dist=2.0,
+                goal_search_radius=1.5,
+            )
+            if wp is None:
+                continue
+            dist = float(np.linalg.norm(center_xy - pos_xy))
+            if dist < best_dist:
+                best_dist = dist
+                best_wp = np.array(
+                    [float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float
+                )
+        return best_wp
+
+    def _build_delivery_queue(self) -> list:
+        """收集已巡检目标，从 home 出发最近邻贪心排序，返回 [(tid, pos), ...]。"""
+        candidates = []
+        for tid, info in self.target_manager.targets.items():
+            if not info.inspected:
+                continue
+            pos = (
+                info.measured_position_at_inspect.copy()
+                if info.measured_position_at_inspect is not None
+                else info.position.copy()
+            )
+            candidates.append((int(tid), pos))
+        if not candidates:
+            return []
+        ordered = []
+        current_xy = np.asarray(self._home_pos[:2], dtype=float)
+        remaining = list(candidates)
+        while remaining:
+            dists = [
+                float(np.linalg.norm(np.asarray(p[:2], dtype=float) - current_xy))
+                for _, p in remaining
+            ]
+            best_i = int(np.argmin(np.asarray(dists, dtype=float)))
+            tid, pos = remaining.pop(best_i)
+            ordered.append((tid, pos))
+            current_xy = np.asarray(pos[:2], dtype=float)
+        return ordered
+
+    def _handle_deliver(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
+        """投递阶段：按队列顺序飞往每个已巡检目标，悬停投递后继续下一个。"""
+        hover_total = int(self._deliver_hover_secs * 48)
+
+        if self._deliver_current_idx >= len(self._deliver_queue):
+            self._log("DELIVER: all deliveries complete")
+            return Command(
+                target_pos=self._home_pos.copy(),
+                target_rpy=rpy,
+                finished=True,
+                info="delivery_done",
+            )
+
+        tid, target_pos = self._deliver_queue[self._deliver_current_idx]
+        hover = np.array(
+            [float(target_pos[0]), float(target_pos[1]), self.takeoff_height],
+            dtype=float,
+        )
+        dist_xy = float(np.linalg.norm(pos[:2] - hover[:2]))
+
+        if self._deliver_hover_remaining > 0:
+            self._deliver_hover_remaining -= 1
+            if self._deliver_hover_remaining == 0:
+                self._log(
+                    f"DELIVER: target {tid} delivered "
+                    f"({self._deliver_current_idx + 1}/{len(self._deliver_queue)})"
+                )
+                self._deliver_current_idx += 1
+            return Command(target_pos=hover, target_rpy=rpy, finished=False, info="delivering")
+
+        if dist_xy < self.waypoint_reach_dist:
+            self._deliver_hover_remaining = hover_total
+            self._log(f"DELIVER: reached target {tid}, hovering {self._deliver_hover_secs:.1f}s")
+            return Command(target_pos=hover, target_rpy=rpy, finished=False, info="delivering")
+
+        wp = self.planner.get_waypoint_towards_goal(
+            drone_pos=pos,
+            goal_pos=target_pos[:2],
+            lookahead_dist=self.goto_path_lookahead_dist,
+            goal_search_radius=self.goto_goal_search_radius,
+        )
+        if wp is not None:
+            nav_wp = np.array(
+                [float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float
+            )
+            return Command(target_pos=nav_wp, target_rpy=rpy, finished=False, info="delivering")
+
+        return Command(target_pos=hover, target_rpy=rpy, finished=False, info="delivering")
 
     def _log(self, msg: str) -> None:
         if self.verbose:

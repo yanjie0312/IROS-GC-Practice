@@ -1,7 +1,10 @@
 # my_project/main.py
+import os
 import time
 import numpy as np
 import pybullet as p
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from collections import deque
 
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
@@ -15,7 +18,7 @@ from my_project.env.sensors import SensorSuite
 from my_project.env.targets import TargetManager
 from my_project.control.pid import PIDController
 from my_project.navigation.base import State
-from my_project.navigation.occupancy_grid import OCCUPIED, FREE, OccupancyGrid, GridBounds
+from my_project.navigation.occupancy_grid import OCCUPIED, FREE, UNKNOWN, OccupancyGrid, GridBounds
 from my_project.navigation.frontier_planner import FrontierPlanner
 from my_project.navigation.avoidance import AvoidanceLayer
 from my_project.navigation.search_mission import SearchMission
@@ -31,6 +34,88 @@ EXPLORED_OVERLAY_Z = 0.02
 EXPLORED_OVERLAY_INTERVAL = 2   # 每 N 步更新一次
 # 黄色含义：栅格 FREE = 射线曾穿过该格（累积地图），不是「当前射线范围」。
 # 另一房间有黄 = 曾到过该房或 2D 投影下射线经门洞穿过。目标「已发现」= 本帧传感器 LOS，与 FREE 无关。
+
+def _plot_flight_result(
+    trajectory: list,
+    grid: OccupancyGrid,
+    target_manager: "TargetManager",
+    home_pos: np.ndarray,
+    result: dict,
+    save_path: str = "results/trajectory.png",
+) -> None:
+    """飞行结束后生成俯视轨迹图，保存到文件。"""
+    fig, ax = plt.subplots(figsize=(13, 13))
+
+    # 占据栅格背景：UNKNOWN=浅灰，FREE=米白，OCCUPIED=深色
+    g = grid.grid
+    rgb = np.ones((*g.shape, 3), dtype=float) * 0.82       # 默认灰（UNKNOWN）
+    rgb[g == FREE]     = [0.97, 0.97, 0.88]                 # FREE：米白
+    rgb[g == OCCUPIED] = [0.22, 0.22, 0.22]                 # OCCUPIED：深灰
+    b = grid.bounds
+    extent = [b.x_min, b.x_max, b.y_min, b.y_max]
+    ax.imshow(rgb, origin="lower", extent=extent, aspect="equal", interpolation="nearest")
+
+    # 轨迹（蓝色渐深，越晚越深）
+    if trajectory:
+        traj = np.array(trajectory)
+        n = len(traj)
+        for i in range(n - 1):
+            alpha = 0.3 + 0.7 * i / max(n - 1, 1)
+            ax.plot(traj[i:i+2, 0], traj[i:i+2, 1], "-",
+                    color="royalblue", alpha=alpha, linewidth=1.0)
+        ax.plot(traj[-1, 0], traj[-1, 1], "s",
+                color="crimson", markersize=9, zorder=6, label="终点")
+
+    # 起飞点
+    ax.plot(home_pos[0], home_pos[1], "^",
+            color="limegreen", markersize=14, zorder=7,
+            markeredgecolor="darkgreen", markeredgewidth=1.2, label="起飞点/Home")
+
+    # 目标点
+    for tid, info in target_manager.targets.items():
+        pos = info.position
+        if np.linalg.norm(pos) < 1e-6:
+            continue
+        if info.inspected:
+            ax.plot(pos[0], pos[1], "*", color="gold", markersize=20, zorder=8,
+                    markeredgecolor="darkorange", markeredgewidth=1.5)
+            ax.annotate(f"T{tid} ✓", (pos[0], pos[1]),
+                        xytext=(6, 6), textcoords="offset points",
+                        fontsize=9, color="darkorange", fontweight="bold")
+        elif info.discovered:
+            ax.plot(pos[0], pos[1], "*", color="orange", markersize=16, zorder=8,
+                    markeredgecolor="saddlebrown", markeredgewidth=1.2)
+            ax.annotate(f"T{tid}", (pos[0], pos[1]),
+                        xytext=(6, 6), textcoords="offset points",
+                        fontsize=9, color="saddlebrown")
+
+    # 标题与坐标轴
+    status = "成功" if result["success"] else result["termination_reason"]
+    ax.set_title(
+        f"飞行结果: {status}  |  用时: {result['flight_time_sec']:.1f}s  |  "
+        f"巡检: {result['targets_inspected']}/{result['targets_total']} 个目标",
+        fontsize=13, fontweight="bold",
+    )
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.grid(True, alpha=0.25, linestyle="--")
+
+    legend_elements = [
+        Line2D([0], [0], color="royalblue", linewidth=2, label="飞行轨迹"),
+        Line2D([0], [0], marker="^", color="limegreen", markersize=11,
+               linestyle="None", markeredgecolor="darkgreen", label="起飞点/Home"),
+        Line2D([0], [0], marker="*", color="gold", markersize=13,
+               linestyle="None", markeredgecolor="darkorange", label="已巡检目标"),
+        Line2D([0], [0], marker="*", color="orange", markersize=12,
+               linestyle="None", markeredgecolor="saddlebrown", label="已发现未巡检"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right", fontsize=9)
+
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"\n[Plot] 轨迹图已保存 → {save_path}")
+    plt.close(fig)
+
 
 def main():
     # 1) 创建场景 & 初始化 env
@@ -59,7 +144,7 @@ def main():
         physics=CFG["physics"],
         pyb_freq=CFG["simulation_freq_hz"],
         ctrl_freq=CFG["control_freq_hz"],
-        gui=True,
+        gui=bool(CFG.get("gui", True)),
         obstacles=False,
     )
 
@@ -182,6 +267,8 @@ def main():
         l1_explore_hardening=l1_enabled,
         l2_explore_hardening=l2_enabled,
         l3_explore_hardening=hardening_enabled,
+        enable_delivery=bool(CFG.get("enable_delivery_mission", False)),
+        deliver_hover_secs=float(CFG.get("delivery_hover_secs", 2.0)),
         verbose=True,
     )
     manager = MissionManager(
@@ -205,6 +292,7 @@ def main():
     manager.reset(init_state)
 
     # 8) 主循环
+    trajectory: list = []   # 记录飞行轨迹，用于结束后绘图
     START = time.time()
     # 运行时长以 MAX_DURATION_SEC 为主，再按难度缩放（与场景默认策略一致）
     if profile_name.startswith("L3"):
@@ -292,6 +380,8 @@ def main():
         last_i = i
         last_t = t
         last_pos = np.asarray(pkt["pos"], dtype=float).copy()
+        if i % 3 == 0:
+            trajectory.append(last_pos[:2].copy())
 
         # 物理扰动注入（L0_easy 时输出零力）
         try:
@@ -627,6 +717,15 @@ def main():
         env.close()
     except p.error:
         pass
+
+    _plot_flight_result(
+        trajectory=trajectory,
+        grid=grid,
+        target_manager=target_manager,
+        home_pos=np.array(INIT_XYZS[0], dtype=float),
+        result=result,
+        save_path=str(CFG.get("output_folder", "results")) + "/trajectory.png",
+    )
 
     return result
 
