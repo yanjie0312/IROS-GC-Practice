@@ -570,7 +570,10 @@ def main():
             target_rpy=cmd.target_rpy,
         )
 
-        sync(i, START, env.CTRL_TIMESTEP)
+        if CFG.get("gui_realtime", True):
+            sync(i, START, env.CTRL_TIMESTEP)
+        elif CFG.get("gui", True) and i % 10 == 0:
+            time.sleep(0.002)  # GUI开启时给OpenGL喘息，防止Mac上渲染过载崩溃
 
     else:
         timeout = True
