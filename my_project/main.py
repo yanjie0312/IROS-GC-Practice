@@ -282,7 +282,12 @@ def main():
             break
 
         # 目标巡检计时
-        target_manager.update(pkt)
+        try:
+            target_manager.update(pkt)
+        except p.error:
+            print("\n=== 物理引擎连接断开，提前结束仿真 ===")
+            termination_reason = "physics_disconnect"
+            break
         episode_collision = episode_collision or bool(pkt.get("collision", False))
         last_i = i
         last_t = t

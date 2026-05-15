@@ -84,7 +84,7 @@ class TargetManager:
                 info.discovered = True
                 if tid in detected_by_id:
                     info.position = detected_by_id[tid].copy()
-                tpos_gt, _ = p.getBasePositionAndOrientation(tid, physicsClientId=self.client)
+                tpos_gt, _ = p.getBasePositionAndOrientation(tid, physicsClientId=self.client)  # may raise p.error → caught by caller
                 tpos_gt = np.asarray(tpos_gt, dtype=float)
                 hint = (
                     "（未配置测距/测向噪声时，仿真中测距/测向为理想值，故估计=实际；真实飞机会有传感器误差）"
@@ -101,7 +101,10 @@ class TargetManager:
                 info.position = detected_by_id[tid].copy()
 
             # 巡检：用真实位置判定是否在范围内（避免估计偏差导致永远不触发）
-            tpos_gt, _ = p.getBasePositionAndOrientation(tid, physicsClientId=self.client)
+            try:
+                tpos_gt, _ = p.getBasePositionAndOrientation(tid, physicsClientId=self.client)
+            except p.error:
+                raise  # 交给 main.py 的 try/except 统一处理物理引擎断开
             tpos_gt = np.asarray(tpos_gt, dtype=float)
             dist_to_gt = float(np.linalg.norm(drone_pos - tpos_gt))
             if dist_to_gt <= self.inspect_range:
