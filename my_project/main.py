@@ -401,12 +401,15 @@ def main():
     # 5) 导航栈
     W = float(layout["W"])
     H_layout = float(layout["H"])
-    inset = 0.05
+    # 栅格边界扩展 0.15m 到外墙外侧，使射线命中外墙的点落在栅格内被标为 OCCUPIED。
+    # 若用 inset=+0.05，左外墙命中点 x=0 在 x_min=0.05 外，永远不会进栅格，
+    # Dijkstra 不知道外墙，会规划贴墙路径，PID 过冲即坠毁。
+    _gmargin = 0.15
     grid = OccupancyGrid(
         resolution=0.10,
         bounds=GridBounds(
-            x_min=0.0 + inset, x_max=W - inset,
-            y_min=-H_layout + inset, y_max=H_layout - inset,
+            x_min=0.0 - _gmargin, x_max=W + _gmargin,
+            y_min=-H_layout - _gmargin, y_max=H_layout + _gmargin,
         ),
         ray_length=2.5,
     )
@@ -415,7 +418,7 @@ def main():
         grid,
         verbose=True,
         waypoint_z=CRUISE_HEIGHT if hardening_enabled else None,
-        inflation_cells=1,
+        inflation_cells=2,  # 0.20m 安全带（比 inflation=1 的 0.10m 翻倍）防止 PID 过冲碰墙
     )
     # L3 下：对“目标被障碍半封堵”的情况更保守，避免 GOTO_TARGET<->EXPLORE 高频抖动
     target_retry_cooldown_steps = 60
@@ -754,8 +757,9 @@ def main():
                 cmd.target_pos = limited
 
             # Hard-bound commands to stay inside apartment envelope.
-            cmd.target_pos[0] = float(np.clip(cmd.target_pos[0], 0.10, W - 0.10))
-            cmd.target_pos[1] = float(np.clip(cmd.target_pos[1], -H_layout + 0.10, H_layout - 0.10))
+            # 0.20m 与 inflation_cells=1 的 Dijkstra 安全带对齐（外墙 OCCUPIED + 1格膨胀 = 0.20m 安全边界）
+            cmd.target_pos[0] = float(np.clip(cmd.target_pos[0], 0.20, W - 0.20))
+            cmd.target_pos[1] = float(np.clip(cmd.target_pos[1], -H_layout + 0.20, H_layout - 0.20))
 
         # 每 5 秒打印进度
         if i % (env.CTRL_FREQ * 5) == 0:

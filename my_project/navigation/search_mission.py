@@ -743,10 +743,6 @@ class SearchMission(BaseMission):
                 wp[2] = self.takeoff_height
             else:
                 wp = np.array([float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float)
-            # 若路径点比当前位置更远离 home，说明路径绕远，直接飞 home 避免越飞越远
-            dist_wp_to_home = float(np.linalg.norm(wp[:2] - home[:2]))
-            if dist_wp_to_home > dist:
-                wp = home.copy()
             return Command(
                 target_pos=wp,
                 target_rpy=rpy,
