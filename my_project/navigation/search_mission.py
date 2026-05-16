@@ -532,6 +532,19 @@ class SearchMission(BaseMission):
                         self._log(f"EXPLORE: stuck, replan frontier → {wp.round(2)}")
                     else:
                         self._log(f"EXPLORE: next frontier → {wp.round(2)}")
+
+                    # 被障碍物困住检测：force_replan 后航点仍然极近，说明直线可达被障碍堵死
+                    # 切换到大步长 Dijkstra 导航（不做直线过滤），绕过障碍物群逃出去
+                    if force_replan and self.planner.get_frontier_centers():
+                        step_size = float(np.linalg.norm(wp[:2] - pos[:2]))
+                        if step_size < 0.20 and self._cur_step >= self._room_exit_cooldown_step:
+                            escape_wp = self._navigate_toward_global_frontier(pos)
+                            if escape_wp is not None and float(np.linalg.norm(escape_wp[:2] - pos[:2])) > step_size:
+                                wp = escape_wp
+                                self._current_waypoint = wp
+                                self._room_exit_cooldown_step = self._cur_step + 30
+                                self._log(f"EXPLORE: obstacle trap (step={step_size:.2f}m), escape → {wp.round(2)}")
+
                 self._last_frontier_pick_step = self._cur_step
                 if force_replan:
                     self._reset_stuck_anchor(pos)

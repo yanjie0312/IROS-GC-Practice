@@ -27,6 +27,7 @@ class FrontierPlanner:
         reachability_step: float | None = None,
         path_lookahead_dist: float = 0.8,
         path_connectivity: int = 8,
+        inflation_cells: int = 2,
         verbose: bool = False,
     ):
         if cluster_connectivity not in (4, 8):
@@ -41,6 +42,7 @@ class FrontierPlanner:
         self.min_cluster_size = int(min_cluster_size)
         self.done_frontier_streak = int(max(1, done_frontier_streak))
         self.waypoint_z = waypoint_z
+        self._inflation_cells = int(max(0, inflation_cells))
         self.reachability_step = (
             float(reachability_step)
             if reachability_step is not None
@@ -387,11 +389,34 @@ class FrontierPlanner:
         # No directly reachable representative among current frontier clusters.
         return -1, None
 
+    def _make_safe_mask(self) -> np.ndarray:
+        """
+        Return a boolean array (h×w) that is True where a cell is FREE
+        and not within self._inflation_cells of any OCCUPIED cell.
+        Uses pure numpy shifts — no scipy dependency.
+        """
+        h, w = self.grid.height, self.grid.width
+        occupied = (self.grid.grid == OCCUPIED)
+        k = self._inflation_cells
+        if k <= 0:
+            return (self.grid.grid == FREE)
+        inflated = np.zeros((h, w), dtype=bool)
+        for dr in range(-k, k + 1):
+            for dc in range(-k, k + 1):
+                r_src_lo = max(0, dr);  r_src_hi = min(h, h + dr)
+                r_dst_lo = max(0, -dr); r_dst_hi = min(h, h - dr)
+                c_src_lo = max(0, dc);  c_src_hi = min(w, w + dc)
+                c_dst_lo = max(0, -dc); c_dst_hi = min(w, w - dc)
+                inflated[r_dst_lo:r_dst_hi, c_dst_lo:c_dst_hi] |= (
+                    occupied[r_src_lo:r_src_hi, c_src_lo:c_src_hi]
+                )
+        return (self.grid.grid == FREE) & ~inflated
+
     def _compute_free_space_tree(
         self,
         start_idx: Tuple[int, int],
     ) -> Tuple[np.ndarray, Dict[Tuple[int, int], Tuple[int, int] | None]]:
-        """最短路径树，FREE 代价 1.0，UNKNOWN 代价 2.0，可穿过未观测区域到达 frontier（如门洞）。"""
+        """最短路径树，只在 FREE 且距 OCCUPIED >= inflation_cells 格的安全格上扩展。"""
         h, w = self.grid.height, self.grid.width
         dist = np.full((h, w), np.inf, dtype=np.float32)
         parent: Dict[Tuple[int, int], Tuple[int, int] | None] = {}
@@ -400,7 +425,9 @@ class FrontierPlanner:
         if int(self.grid.grid[sr, sc]) == OCCUPIED:
             return dist, parent
 
-        # (cost, (r, c)) 优先队列，优先扩展代价小的格
+        safe_mask = self._make_safe_mask()
+
+        # (cost, (r, c)) 优先队列
         heap: List[Tuple[float, Tuple[int, int]]] = [(0.0, (sr, sc))]
         dist[sr, sc] = 0.0
         parent[(sr, sc)] = None
@@ -410,8 +437,7 @@ class FrontierPlanner:
             if base > float(dist[r, c]):
                 continue
             for nr, nc in self._navigation_neighbors(r, c):
-                cell = int(self.grid.grid[nr, nc])
-                if cell != FREE:
+                if not safe_mask[nr, nc]:
                     continue
                 new_dist = base + 1.0
                 if new_dist < dist[nr, nc]:

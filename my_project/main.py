@@ -412,6 +412,7 @@ def main():
         grid,
         verbose=True,
         waypoint_z=CRUISE_HEIGHT if hardening_enabled else None,
+        inflation_cells=1,
     )
     # L3 下：对“目标被障碍半封堵”的情况更保守，避免 GOTO_TARGET<->EXPLORE 高频抖动
     target_retry_cooldown_steps = 60
@@ -554,7 +555,7 @@ def main():
         last_i = i
         last_t = t
         last_pos = np.asarray(pkt["pos"], dtype=float).copy()
-        if i % 3 == 0:
+        if i % 2 == 0:
             trajectory.append(last_pos[:2].copy())
 
         # 物理扰动注入（L0_easy 时输出零力）

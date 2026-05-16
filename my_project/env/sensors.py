@@ -101,7 +101,7 @@ class SensorSuite:
         arena_handle: Optional[Any] = None,
         ray_dirs_body: Optional[np.ndarray] = None,
         ray_length: float = 2.5,
-        ray_start_offset: float = 0.06,
+        ray_start_offset: float = 0.02,
         closest_query_distance: float = 0.8,
         collision_distance: float = 0.02,
         target_mode: str = "hybrid",  # "gt" | "camera" | "hybrid"
