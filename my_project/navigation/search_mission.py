@@ -107,7 +107,7 @@ class SearchMission(BaseMission):
         self._region_retreat_until_step = -1
         self._region_stuck_radius = 1.0
         self._region_stuck_steps = 400
-        self._region_retreat_duration_steps = 150
+        self._region_retreat_duration_steps = 240  # 原150步≈3s，改为240步≈5s，给撤退足够时间离开卡死区
         self._just_finished_retreat = False
         # 防抖：retreat 刚结束后短时间内禁止再次进入 retreat，避免日志刷屏与状态抖动
         self._retreat_resume_cooldown_steps = 120
@@ -120,7 +120,7 @@ class SearchMission(BaseMission):
             self._region_anchor_update_dist = 1.2
         self._retreat_waypoint_min_dist = 1.0
         # 同区域内重规划次数超过此次数也视为区域卡住（不必等 400 步）
-        self._region_stuck_replan_threshold = 10
+        self._region_stuck_replan_threshold = 5   # 原10次重规划触发撤退，改为5次更快逃脱
         self._region_replan_count = 0
         # 同区域重规划超过此次数后，每次选点都排除当前方向，主动换 cluster
         self._region_exclude_after_replans = 5
@@ -266,6 +266,13 @@ class SearchMission(BaseMission):
                 self._log(f"EXPLORE: guide toward target {tid} → {guided_wp.round(2)}")
 
         # 撤退阶段：向起飞点后退一段，离开当前房间
+        # Bug1修复：撤退窗口到期但未到达撤退点时，强制清零，避免区域卡死检测被永久禁用
+        if self._region_retreat_until_step >= 0 and self._cur_step >= self._region_retreat_until_step:
+            self._region_retreat_until_step = -1
+            self._region_anchor_pos = np.asarray(pos, dtype=float).copy()
+            self._region_anchor_step = self._cur_step
+            self._region_replan_count = 0
+            self._just_finished_retreat = True
         if self._region_retreat_until_step >= 0 and self._cur_step < self._region_retreat_until_step:
             dist_to_retreat_wp = float(np.linalg.norm(pos[:2] - self._current_waypoint[:2]))
             if dist_to_retreat_wp < self.waypoint_reach_dist:
@@ -695,8 +702,8 @@ class SearchMission(BaseMission):
             self._log("→ DONE")
             return Command(target_pos=self._home_pos.copy(), target_rpy=rpy)
 
-        # 悬停在目标上方，等待计时完成
-        return Command(target_pos=tpos.copy(), target_rpy=rpy)
+        # 悬停在目标上方，等待计时完成（避障层不应干扰精确悬停）
+        return Command(target_pos=tpos.copy(), target_rpy=rpy, info="inspect")
 
     def _handle_done(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
         home = self._home_pos.copy()

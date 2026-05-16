@@ -18,7 +18,7 @@ class MissionManager:
 
     def update(self, state, sensors) -> Command:
         cmd = self.mission.update(state, sensors)
-        if self.avoidance and not cmd.finished:
+        if self.avoidance and not cmd.finished and cmd.info != "inspect":
             raw = self.avoidance.filter_target(state, sensors, cmd.target_pos)
             if (
                 self._smooth_target is None
