@@ -26,6 +26,8 @@ from my_project.navigation.frontier_planner import FrontierPlanner
 from my_project.navigation.avoidance import AvoidanceLayer
 from my_project.navigation.search_mission import SearchMission
 from my_project.navigation.mission_manager import MissionManager
+from my_project.experiments.scenarios import list_difficulty_profiles
+from my_project.ui.difficulty_picker import resolve_difficulty_profile
 
 
 CRUISE_HEIGHT = 0.5    # 巡航高度（m），低于墙顶 1.0m
@@ -138,6 +140,7 @@ def _save_flight_data(
         },
     }
     json_path = base_path + ".json"
+    os.makedirs(os.path.dirname(os.path.abspath(json_path)), exist_ok=True)
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     print(f"[Data]  saved → {json_path}")
@@ -936,4 +939,28 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    _profiles = list_difficulty_profiles()
+    _parser = argparse.ArgumentParser(description="Indoor drone search simulation")
+    _parser.add_argument(
+        "-d", "--difficulty",
+        choices=_profiles,
+        help="Set difficulty and skip the startup picker",
+    )
+    _parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Skip picker; use difficulty_profile from config.py",
+    )
+    _args = _parser.parse_args()
+
+    CFG["difficulty_profile"] = resolve_difficulty_profile(
+        cli_difficulty=_args.difficulty,
+        no_prompt=_args.no_prompt,
+        prompt_enabled=bool(CFG.get("prompt_difficulty_at_start", True)),
+        config_default=str(CFG.get("difficulty_profile", "L0_easy")),
+    )
+    print(f"[Difficulty] Running profile: {CFG['difficulty_profile']}")
+
     r = main()
