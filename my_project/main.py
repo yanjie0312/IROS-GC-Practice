@@ -418,7 +418,7 @@ def main():
         grid,
         verbose=True,
         waypoint_z=CRUISE_HEIGHT if hardening_enabled else None,
-        inflation_cells=2,  # 0.20m 安全带（比 inflation=1 的 0.10m 翻倍）防止 PID 过冲碰墙
+        inflation_cells=1,
     )
     # L3 下：对“目标被障碍半封堵”的情况更保守，避免 GOTO_TARGET<->EXPLORE 高频抖动
     target_retry_cooldown_steps = 60
@@ -455,10 +455,10 @@ def main():
     manager = MissionManager(
         mission=mission,
         avoidance_layer=AvoidanceLayer(
-            d0=0.6,    # 只在 0.6m 内才产生排斥力，不干扰正常巡航
-            k_rep=0.5, # 排斥力系数保持温和
-            alpha=0.3, # 仅 30% 权重给安全方向，主要信任 frontier 航点
-            min_dist_emergency=0.15,  # 紧急情况（<0.15m）自动放大排斥力
+            d0=0.8,
+            k_rep=0.5,
+            alpha=0.45,
+            min_dist_emergency=0.15,
         ),
     )
 
