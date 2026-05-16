@@ -223,7 +223,7 @@ class TargetManager:
             else:
                 pos = info.position
             out.append({
-                "id": self._id_to_idx[tid],   # 用户可读序号 0,1,2,...
+                "id": self._id_to_idx[tid],
                 "inspected": info.inspected,
                 "measured_xy": (float(pos[0]), float(pos[1])),
                 "measured_xyz": (float(pos[0]), float(pos[1]), float(pos[2])),
