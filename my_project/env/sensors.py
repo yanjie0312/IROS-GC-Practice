@@ -30,8 +30,8 @@ def build_default_ray_dirs() -> np.ndarray:
     """
     dirs: List[np.ndarray] = []
 
-    # 16 rays on horizontal plane
-    for deg in np.linspace(0.0, 360.0, 16, endpoint=False):
+    # 32 rays on horizontal plane
+    for deg in np.linspace(0.0, 360.0, 32, endpoint=False):
         rad = np.deg2rad(float(deg))
         dirs.append(np.array([np.cos(rad), np.sin(rad), 0.0], dtype=float))
 

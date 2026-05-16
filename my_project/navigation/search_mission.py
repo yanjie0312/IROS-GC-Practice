@@ -274,13 +274,16 @@ class SearchMission(BaseMission):
                 self._region_anchor_step = self._cur_step
                 self._region_replan_count = 0
                 self._just_finished_retreat = True  # 下一帧选 frontier 时排除原 cluster，强制尝试其他房间
-                if self._l3_explore_hardening or self._l2_explore_hardening:
-                    cooldown = (
-                        self._retreat_resume_cooldown_steps
-                        if self._l3_explore_hardening
-                        else int(self._retreat_resume_cooldown_steps * 0.5)
-                    )
-                    self._retreat_resume_block_until_step = self._cur_step + cooldown
+                # 所有难度都设置冷却，防止撤退后立刻返回同一区域
+                if self._l3_explore_hardening:
+                    frac = 1.0
+                elif self._l2_explore_hardening:
+                    frac = 0.5
+                else:
+                    frac = 0.3  # L0/L1：36步≈0.75s 的短暂冷却
+                self._retreat_resume_block_until_step = self._cur_step + int(
+                    self._retreat_resume_cooldown_steps * frac
+                )
                 # L2：记录离开房间时的 cluster center，短时间内保持 exclude，避免“出来后又回去”
                 if self._l2_explore_hardening:
                     center = self.planner.get_last_selected_cluster_center()
@@ -309,10 +312,7 @@ class SearchMission(BaseMission):
                 and discovered_count < total
                 and dist_to_anchor < self._region_stuck_radius
                 and (replan_stuck or time_stuck)
-                and (
-                    not (self._l3_explore_hardening or self._l2_explore_hardening)
-                    or self._cur_step >= self._retreat_resume_block_until_step
-                )
+                and self._cur_step >= self._retreat_resume_block_until_step
             ):
                 center = self.planner.get_last_selected_cluster_center()
                 exclude_xy = center if center is not None else self._current_waypoint[:2]
@@ -361,6 +361,11 @@ class SearchMission(BaseMission):
         # 判断是否到达当前 frontier 航点（水平距离）
         dist_xy = float(np.linalg.norm(pos[:2] - self._current_waypoint[:2]))
         force_replan = self._is_explore_stuck(pos)
+        # 当前航点路径被新检测到的障碍物堵住 → 立即重规划
+        if not force_replan and dist_xy > self.waypoint_reach_dist:
+            if not self.planner._is_directly_reachable(pos[:2], self._current_waypoint[:2]):
+                force_replan = True
+                self._reset_stuck_anchor(pos)
         if dist_xy < self.waypoint_reach_dist or force_replan:
             if (not force_replan) and (
                 (self._cur_step - self._last_frontier_pick_step) < self.frontier_replan_cooldown_steps
@@ -765,7 +770,15 @@ class SearchMission(BaseMission):
         ray_dists = sensors.get("ray_dists")
         ray_dirs_world = sensors.get("ray_dirs_world")
         if ray_dists is not None and ray_dirs_world is not None:
-            self.planner.update(pos, ray_dists, ray_dirs_world)
+            dirs = np.asarray(ray_dirs_world, dtype=float)
+            dists = np.asarray(ray_dists, dtype=float)
+            # 只用水平射线更新 2D 栅格：倾斜射线会从墙底/顶越过，
+            # 其 XY 投影会错误地把墙另一侧的格子标为 FREE
+            if dirs.ndim == 2 and dirs.shape[1] >= 3:
+                horiz = np.abs(dirs[:, 2]) < 0.15
+                dirs = dirs[horiz]
+                dists = dists[horiz]
+            self.planner.update(pos, dists, dirs)
 
     def _pick_next_frontier(
         self, pos: np.ndarray, exclude_xy: Optional[np.ndarray] = None

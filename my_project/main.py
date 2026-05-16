@@ -449,7 +449,7 @@ def main():
     manager = MissionManager(
         mission=mission,
         avoidance_layer=AvoidanceLayer(
-            d0=0.4,    # 只在 0.4m 内才产生排斥力，不干扰正常巡航
+            d0=0.6,    # 只在 0.6m 内才产生排斥力，不干扰正常巡航
             k_rep=0.5, # 排斥力系数保持温和
             alpha=0.3, # 仅 30% 权重给安全方向，主要信任 frontier 航点
             min_dist_emergency=0.15,  # 紧急情况（<0.15m）自动放大排斥力
