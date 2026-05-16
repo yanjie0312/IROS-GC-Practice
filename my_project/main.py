@@ -20,6 +20,7 @@ from my_project.experiments.scenarios import make_scenario
 from my_project.env.sensors import SensorSuite
 from my_project.env.targets import TargetManager
 from my_project.control.pid import PIDController
+from my_project.control.adaptive_tuning import WindCompensator
 from my_project.navigation.base import State
 from my_project.navigation.occupancy_grid import OCCUPIED, FREE, UNKNOWN, OccupancyGrid, GridBounds
 from my_project.navigation.frontier_planner import FrontierPlanner
@@ -175,18 +176,19 @@ def _plot_flight_result(
             zorder=7, markeredgecolor="darkgreen", markeredgewidth=1.2)
     for tid, info in target_manager.targets.items():
         pos = info.position
+        idx = target_manager._id_to_idx[tid]
         if np.linalg.norm(pos) < 1e-6:
             continue
         if info.inspected:
             ax.plot(pos[0], pos[1], "*", color="gold", markersize=18, zorder=8,
                     markeredgecolor="darkorange", markeredgewidth=1.5)
-            ax.annotate(f"T{tid} OK", (pos[0], pos[1]), xytext=(5, 5),
+            ax.annotate(f"T{idx} OK", (pos[0], pos[1]), xytext=(5, 5),
                         textcoords="offset points", fontsize=8,
                         color="darkorange", fontweight="bold")
         elif info.discovered:
             ax.plot(pos[0], pos[1], "*", color="orange", markersize=15, zorder=8,
                     markeredgecolor="saddlebrown", markeredgewidth=1.2)
-            ax.annotate(f"T{tid}", (pos[0], pos[1]), xytext=(5, 5),
+            ax.annotate(f"T{idx}", (pos[0], pos[1]), xytext=(5, 5),
                         textcoords="offset points", fontsize=8, color="saddlebrown")
     ax.set_title("Drone Perception\n(gray=unknown, cream=explored, dark=wall/obstacle)",
                  fontsize=11, fontweight="bold")
@@ -218,18 +220,19 @@ def _plot_flight_result(
     # 真实目标位置
     for tid, info in target_manager.targets.items():
         gt_pos = targets_gt.get(int(tid))
+        idx = target_manager._id_to_idx[tid]
         if gt_pos is None:
             continue
         if info.inspected:
             ax2.plot(gt_pos[0], gt_pos[1], "*", color="gold", markersize=18,
                      zorder=8, markeredgecolor="darkorange", markeredgewidth=1.5)
-            ax2.annotate(f"T{tid} OK", (gt_pos[0], gt_pos[1]), xytext=(5, 5),
+            ax2.annotate(f"T{idx} OK", (gt_pos[0], gt_pos[1]), xytext=(5, 5),
                          textcoords="offset points", fontsize=8,
                          color="darkorange", fontweight="bold")
         elif info.discovered:
             ax2.plot(gt_pos[0], gt_pos[1], "*", color="orange", markersize=15,
                      zorder=8, markeredgecolor="saddlebrown", markeredgewidth=1.2)
-            ax2.annotate(f"T{tid}", (gt_pos[0], gt_pos[1]), xytext=(5, 5),
+            ax2.annotate(f"T{idx}", (gt_pos[0], gt_pos[1]), xytext=(5, 5),
                          textcoords="offset points", fontsize=8, color="saddlebrown")
         else:
             ax2.plot(gt_pos[0], gt_pos[1], "*", color="lightgray", markersize=15,
@@ -456,8 +459,14 @@ def main():
         ),
     )
 
-    # 6) PID
+    # 6) PID + 风力补偿器
     pid = PIDController(drone_model=CFG["drone"])
+    wind_comp = WindCompensator(
+        tau_s=3.0,          # 3s 时间常数，过滤随机阵风，保留稳态偏置
+        ctrl_freq=env.CTRL_FREQ,
+        gain=0.5,           # 50% 补偿量，保守起步
+        max_comp_m=0.4,     # 最大补偿 0.4m，防止过补偿
+    )
 
     # 7) 初始化：先 step 一次拿到观测，再 reset 任务状态机
     action = np.zeros((1, 4))
@@ -815,7 +824,7 @@ def main():
             print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
             for r in target_manager.get_inspection_result():
                 if r["inspected"]:
-                    print(f"  目标 id={r['id']}  测得坐标(传感器)=[{r['measured_xyz'][0]:.3f}, {r['measured_xyz'][1]:.3f}, {r['measured_xyz'][2]:.3f}]")
+                    print(f"  T{r['id']}  测得坐标=[{r['measured_xyz'][0]:.3f}, {r['measured_xyz'][1]:.3f}, {r['measured_xyz'][2]:.3f}]")
             termination_reason = "crash"
             crash_pos = np.asarray(pkt["pos"], dtype=float).copy()
             break
@@ -827,10 +836,17 @@ def main():
             print(f"巡检结果：{inspected}/{total} 个目标完成巡检")
             for r in target_manager.get_inspection_result():
                 if r["inspected"]:
-                    print(f"  目标 id={r['id']}  测得坐标(传感器)=[{r['measured_xyz'][0]:.3f}, {r['measured_xyz'][1]:.3f}, {r['measured_xyz'][2]:.3f}]")
+                    print(f"  T{r['id']}  测得坐标=[{r['measured_xyz'][0]:.3f}, {r['measured_xyz'][1]:.3f}, {r['measured_xyz'][2]:.3f}]")
             termination_reason = "mission_complete"
             success = True
             break
+
+        # 风力补偿：用位置误差 EMA 估计稳态风漂，把目标点向反方向偏移
+        if not cmd.finished and i > env.CTRL_FREQ:  # 跳过起飞初始 1s
+            wind_comp.update(pkt["pos"], cmd.target_pos)
+            cmd.target_pos = wind_comp.compensate(cmd.target_pos)
+            # 补偿后确保高度不低于下限
+            cmd.target_pos[2] = max(float(cmd.target_pos[2]), CRUISE_HEIGHT)
 
         # PID 计算电机输出
         action[0, :] = pid.compute(

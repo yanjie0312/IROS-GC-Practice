@@ -53,6 +53,10 @@ class TargetManager:
                 target_id=int(tid),
                 position=np.zeros(3, dtype=float),
             )
+        # PyBullet body ID → 用户可读序号（0, 1, 2, ...）
+        self._id_to_idx: Dict[int, int] = {
+            tid: i for i, tid in enumerate(sorted(self.targets.keys()))
+        }
         self._last_estimate_print_t: float = -1e9
         self._estimate_print_interval: float = 1.0  # 发现目标后每 1.0 秒打印一次当前估计
         self._last_printed_estimate: Dict[int, np.ndarray] = {}
@@ -86,14 +90,10 @@ class TargetManager:
                     info.position = detected_by_id[tid].copy()
                 tpos_gt, _ = p.getBasePositionAndOrientation(tid, physicsClientId=self.client)  # may raise p.error → caught by caller
                 tpos_gt = np.asarray(tpos_gt, dtype=float)
-                hint = (
-                    "（未配置测距/测向噪声时，仿真中测距/测向为理想值，故估计=实际；真实飞机会有传感器误差）"
-                    if np.allclose(info.position, tpos_gt, atol=1e-5) else ""
-                )
                 print(
-                    f"[TargetManager] 发现目标 id={tid}  "
-                    f"实际坐标(仅显示,不给无人机)=[{tpos_gt[0]:.3f} {tpos_gt[1]:.3f} {tpos_gt[2]:.3f}]  "
-                    f"估计坐标(无人机用于飞行)=[{info.position[0]:.3f} {info.position[1]:.3f} {info.position[2]:.3f}] {hint}"
+                    f"[TargetManager] 发现目标 T{self._id_to_idx[tid]}  "
+                    f"实际坐标(仅显示)=[{tpos_gt[0]:.3f} {tpos_gt[1]:.3f} {tpos_gt[2]:.3f}]  "
+                    f"估计坐标(导航用)=[{info.position[0]:.3f} {info.position[1]:.3f} {info.position[2]:.3f}]"
                 )
 
             # 已有检测时持续用本帧测量更新估计（便于看到估计随测算更新）
@@ -115,10 +115,9 @@ class TargetManager:
                     else:
                         info.position = tpos_gt.copy()  # 先进入范围再“发现”时无检测帧，用 GT 避免飞向原点
                     print(
-                        f"[TargetManager] 发现目标 id={tid}  "
-                        f"实际坐标(仅显示,不给无人机)=[{tpos_gt[0]:.3f} {tpos_gt[1]:.3f} {tpos_gt[2]:.3f}]  "
-                        f"估计坐标(无人机用于飞行)=[{info.position[0]:.3f} {info.position[1]:.3f} {info.position[2]:.3f}]"
-                        f"{' （未配置测距/测向噪声时，仿真中为理想测量，估计=实际）' if np.allclose(info.position, tpos_gt, atol=1e-5) else ''}"
+                        f"[TargetManager] 发现目标 T{self._id_to_idx[tid]}  "
+                        f"实际坐标(仅显示)=[{tpos_gt[0]:.3f} {tpos_gt[1]:.3f} {tpos_gt[2]:.3f}]  "
+                        f"估计坐标(导航用)=[{info.position[0]:.3f} {info.position[1]:.3f} {info.position[2]:.3f}]"
                     )
                 info.time_in_range += dt
                 if info.time_in_range >= self.inspect_time:
@@ -135,11 +134,8 @@ class TargetManager:
             any_printed = False
             for tid, info in self.targets.items():
                 if info.discovered and not info.inspected and np.linalg.norm(info.position) >= 1e-6:
-                    note = ""
-                    if tid in self._last_printed_estimate and np.allclose(info.position, self._last_printed_estimate[tid], atol=1e-6):
-                        note = "  （与上周期相同：未配置噪声时每帧测量均为真值，估计不变；配置测距/测向噪声后会随测量变化）"
                     print(
-                        f"[TargetManager] 估计目标 id={tid}  当前测得=[{info.position[0]:.3f} {info.position[1]:.3f} {info.position[2]:.3f}]  t={t:.1f}s{note}"
+                        f"[TargetManager] 目标 T{self._id_to_idx[tid]} 当前估计=[{info.position[0]:.3f} {info.position[1]:.3f} {info.position[2]:.3f}]  t={t:.1f}s"
                     )
                     self._last_printed_estimate[tid] = info.position.copy()
                     any_printed = True
@@ -227,7 +223,7 @@ class TargetManager:
             else:
                 pos = info.position
             out.append({
-                "id": tid,
+                "id": self._id_to_idx[tid],   # 用户可读序号 0,1,2,...
                 "inspected": info.inspected,
                 "measured_xy": (float(pos[0]), float(pos[1])),
                 "measured_xyz": (float(pos[0]), float(pos[1]), float(pos[2])),

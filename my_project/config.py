@@ -5,7 +5,7 @@ CFG = {
     "drone": DroneModel("cf2x"),
     "num_drones": 1,
     "physics": Physics("pyb"),
-    "gui": True,
+    "gui": False,
     "gui_realtime": False,   # True=限速实时（Windows）False=全速运行（Mac）
     "record_video": False,
     "plot": False,
