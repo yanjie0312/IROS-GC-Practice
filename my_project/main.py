@@ -32,7 +32,7 @@ from my_project.ui.difficulty_picker import resolve_difficulty_profile
 
 
 CRUISE_HEIGHT = 0.5    # 巡航高度（m），低于墙顶 1.0m
-MAX_DURATION_SEC = 500  # 最长运行时间
+MAX_DURATION_SEC = 300  # 最长运行时间
 # 在 PyBullet 窗口用黄色点画出已探索区域（FREE 格）
 SHOW_EXPLORED_OVERLAY = True
 EXPLORED_OVERLAY_SUBSAMPLE = 2  # 每 N 格画一个点
@@ -463,12 +463,22 @@ def main():
     )
 
     # 6) PID + 风力补偿器
+    # 直接根据场景是否有风决定参数，与 level 名称解耦：
+    #   无风（L0/L1）：vel_gain=0，退化为原始位置误差补偿，几乎不干预
+    #   有风（L2/L3）：双信号补偿，tau 更短、gain 更高、vel_gain 启用
     pid = PIDController(drone_model=CFG["drone"])
+    _has_wind = float(scenario.wind_std) > 0.0
+    if _has_wind:
+        _wc_tau, _wc_gain, _wc_vel_gain, _wc_max = 2.0, 0.70, 0.25, 0.4
+    else:
+        _wc_tau, _wc_gain, _wc_vel_gain, _wc_max = 3.0, 0.50, 0.00, 0.4
     wind_comp = WindCompensator(
-        tau_s=3.0,          # 3s 时间常数，过滤随机阵风，保留稳态偏置
+        tau_s=_wc_tau,
         ctrl_freq=env.CTRL_FREQ,
-        gain=0.5,           # 50% 补偿量，保守起步
-        max_comp_m=0.4,     # 最大补偿 0.4m，防止过补偿
+        gain=_wc_gain,
+        max_comp_m=_wc_max,
+        vel_gain=_wc_vel_gain,
+        vel_tau_s=0.5,
     )
 
     # 7) 初始化：先 step 一次拿到观测，再 reset 任务状态机
@@ -481,16 +491,8 @@ def main():
     # 8) 主循环
     trajectory: list = []   # 记录飞行轨迹，用于结束后绘图
     START = time.time()
-    # 运行时长以 MAX_DURATION_SEC 为主，再按难度缩放（与场景默认策略一致）
-    if profile_name.startswith("L3"):
-        timeout_scale = 0.80
-    elif profile_name.startswith("L2"):
-        timeout_scale = 0.95
-    elif profile_name.startswith("L1"):
-        timeout_scale = 0.95
-    else:
-        timeout_scale = 1.00
-    steps = int(max(1, round(MAX_DURATION_SEC * timeout_scale * env.CTRL_FREQ)))
+    # 运行时长直接用 scenario 的 timeout_steps（统一 300s）
+    steps = int(max(1, scenario.timeout_steps))
     # 防坠补丁参数（L2 轻量，L3 全量）
     z_guard = CRUISE_HEIGHT - (0.16 if light_hardening_enabled and not hardening_enabled else 0.18)
     z_guard_target = CRUISE_HEIGHT + (0.06 if light_hardening_enabled and not hardening_enabled else 0.08)
@@ -735,7 +737,9 @@ def main():
                 ):
                     cmd.target_pos[2] = max(float(cmd.target_pos[2]), z_guard_target)
                     max_xy_step = min(max_xy_step, 0.10 if hardening_enabled else 0.16)
-                # HOLD/不可达附近容易抖动，近障碍再收紧一步长
+                # 近障碍/墙分级降速：有风场景在 0.5m 内提前降速，给风扰留缓冲余量
+                if min_dist < 0.50 and _has_wind:
+                    max_xy_step = min(max_xy_step, 0.28 if hardening_enabled else 0.32)
                 if min_dist < 0.35:
                     max_xy_step = min(max_xy_step, 0.18 if hardening_enabled else 0.22)
                 # 局部卡死脱困：短时抬高并收敛横向机动，优先姿态稳定和脱离障碍边缘
@@ -847,7 +851,7 @@ def main():
 
         # 风力补偿：用位置误差 EMA 估计稳态风漂，把目标点向反方向偏移
         if not cmd.finished and i > env.CTRL_FREQ:  # 跳过起飞初始 1s
-            wind_comp.update(pkt["pos"], cmd.target_pos)
+            wind_comp.update(pkt["pos"], cmd.target_pos, actual_vel=pkt.get("vel"))
             cmd.target_pos = wind_comp.compensate(cmd.target_pos)
             # 补偿后确保高度不低于下限
             cmd.target_pos[2] = max(float(cmd.target_pos[2]), CRUISE_HEIGHT)
