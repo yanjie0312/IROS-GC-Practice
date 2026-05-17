@@ -8,10 +8,10 @@ from my_project.experiments.scenarios import list_difficulty_profiles
 
 # (profile_id, UI title, short description)
 DIFFICULTY_CHOICES = (
-    ("L0_easy", "L0 · Easy", "Ideal conditions; minimal wind, noise, and sensor error"),
-    ("L1_mild", "L1 · Mild", "Light wind, noise, and more obstacles"),
-    ("L2_medium", "L2 · Medium", "Stronger disturbances, comm delay, and uncertainty"),
-    ("L3_hard", "L3 · Hard", "Heavy wind/noise, packet loss, and ground effect"),
+    ("L0_easy",   "L0 · Easy",   "2-room layout, 3 obstacles, 2 targets; no wind or sensor noise"),
+    ("L1_mild",   "L1 · Mild",   "3-room layout, 5 obstacles, 3 targets; no wind or sensor noise"),
+    ("L2_medium", "L2 · Medium", "2-room layout, 3 obstacles, 2 targets; wind and sensor noise"),
+    ("L3_hard",   "L3 · Hard",   "3-room layout, 5 obstacles, 3 targets; wind and sensor noise (500s)"),
 )
 
 
