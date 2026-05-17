@@ -18,6 +18,7 @@ class _Phase(Enum):
     GOTO_TARGET = auto()
     INSPECT = auto()
     DONE = auto()
+    DELIVER = auto()
 
 
 class SearchMission(BaseMission):
@@ -56,6 +57,8 @@ class SearchMission(BaseMission):
         l1_explore_hardening: bool = False,
         l2_explore_hardening: bool = False,
         l3_explore_hardening: bool = False,
+        enable_delivery: bool = False,
+        deliver_hover_secs: float = 2.0,
         verbose: bool = True,
     ):
         """
@@ -104,20 +107,18 @@ class SearchMission(BaseMission):
         self._region_retreat_until_step = -1
         self._region_stuck_radius = 1.0
         self._region_stuck_steps = 400
-        self._region_retreat_duration_steps = 150
+        self._region_retreat_duration_steps = 240  # 原150步≈3s，改为240步≈5s，给撤退足够时间离开卡死区
         self._just_finished_retreat = False
         # 防抖：retreat 刚结束后短时间内禁止再次进入 retreat，避免日志刷屏与状态抖动
         self._retreat_resume_cooldown_steps = 120
         self._retreat_resume_block_until_step = -1
+        # 逃脱目标排名：0=距home最远，1=第二远，依此类推；换区域后重置
+        self._escape_frontier_rank = 0
         # region 锚点更新阈值：越小越容易判定“已经换到新区域”
-        self._region_anchor_update_dist = 1.5
-        if self._l2_explore_hardening:
-            # L2：当位于门洞附近时，位移可能达不到 1.5m；过大的阈值会导致 region 锚点长期不更新
-            # 从而覆盖率停留在局部口袋，出现“出来又回去”的往返循环。
-            self._region_anchor_update_dist = 1.2
+        self._region_anchor_update_dist = 1.0
         self._retreat_waypoint_min_dist = 1.0
         # 同区域内重规划次数超过此次数也视为区域卡住（不必等 400 步）
-        self._region_stuck_replan_threshold = 10
+        self._region_stuck_replan_threshold = 5   # 原10次重规划触发撤退，改为5次更快逃脱
         self._region_replan_count = 0
         # 同区域重规划超过此次数后，每次选点都排除当前方向，主动换 cluster
         self._region_exclude_after_replans = 5
@@ -147,6 +148,14 @@ class SearchMission(BaseMission):
         # L2：retreat 离开一个房间后，短时间内禁止重新选回同一房间 frontier
         self._l2_retreat_exclude_center: np.ndarray | None = None
         self._l2_retreat_exclude_until_step: int = -1
+        # 房间退出：当前区域无 frontier 时主动朝全局 frontier 导航
+        self._room_exit_cooldown_step: int = -1
+        # 投递阶段
+        self._enable_delivery: bool = bool(enable_delivery)
+        self._deliver_hover_secs: float = float(deliver_hover_secs)
+        self._deliver_queue: list = []
+        self._deliver_current_idx: int = 0
+        self._deliver_hover_remaining: int = 0
     # ------------------------------------------------------------------
 
     def reset(self, state: State) -> None:
@@ -180,6 +189,11 @@ class SearchMission(BaseMission):
         self._last_unreachable_hold_log_step = -10**9
         self._l2_retreat_exclude_center = None
         self._l2_retreat_exclude_until_step = -1
+        self._room_exit_cooldown_step = -1
+        self._escape_frontier_rank = 0
+        self._deliver_queue = []
+        self._deliver_current_idx = 0
+        self._deliver_hover_remaining = 0
         self.planner.reset()
         self._log(f"reset → TAKEOFF  home={self._home_pos.round(2)}")
 
@@ -199,6 +213,8 @@ class SearchMission(BaseMission):
             return self._handle_goto_target(pos, zero_rpy)
         elif self._phase == _Phase.INSPECT:
             return self._handle_inspect(pos, zero_rpy)
+        elif self._phase == _Phase.DELIVER:
+            return self._handle_deliver(pos, zero_rpy)
         else:  # DONE
             return self._handle_done(pos, zero_rpy)
 
@@ -249,6 +265,13 @@ class SearchMission(BaseMission):
                 self._log(f"EXPLORE: guide toward target {tid} → {guided_wp.round(2)}")
 
         # 撤退阶段：向起飞点后退一段，离开当前房间
+        # Bug1修复：撤退窗口到期但未到达撤退点时，强制清零，避免区域卡死检测被永久禁用
+        if self._region_retreat_until_step >= 0 and self._cur_step >= self._region_retreat_until_step:
+            self._region_retreat_until_step = -1
+            self._region_anchor_pos = np.asarray(pos, dtype=float).copy()
+            self._region_anchor_step = self._cur_step
+            self._region_replan_count = 0
+            self._just_finished_retreat = True
         if self._region_retreat_until_step >= 0 and self._cur_step < self._region_retreat_until_step:
             dist_to_retreat_wp = float(np.linalg.norm(pos[:2] - self._current_waypoint[:2]))
             if dist_to_retreat_wp < self.waypoint_reach_dist:
@@ -257,13 +280,16 @@ class SearchMission(BaseMission):
                 self._region_anchor_step = self._cur_step
                 self._region_replan_count = 0
                 self._just_finished_retreat = True  # 下一帧选 frontier 时排除原 cluster，强制尝试其他房间
-                if self._l3_explore_hardening or self._l2_explore_hardening:
-                    cooldown = (
-                        self._retreat_resume_cooldown_steps
-                        if self._l3_explore_hardening
-                        else int(self._retreat_resume_cooldown_steps * 0.5)
-                    )
-                    self._retreat_resume_block_until_step = self._cur_step + cooldown
+                # 所有难度都设置冷却，防止撤退后立刻返回同一区域
+                if self._l3_explore_hardening:
+                    frac = 1.0
+                elif self._l2_explore_hardening:
+                    frac = 0.5
+                else:
+                    frac = 0.3  # L0/L1：36步≈0.75s 的短暂冷却
+                self._retreat_resume_block_until_step = self._cur_step + int(
+                    self._retreat_resume_cooldown_steps * frac
+                )
                 # L2：记录离开房间时的 cluster center，短时间内保持 exclude，避免“出来后又回去”
                 if self._l2_explore_hardening:
                     center = self.planner.get_last_selected_cluster_center()
@@ -292,10 +318,7 @@ class SearchMission(BaseMission):
                 and discovered_count < total
                 and dist_to_anchor < self._region_stuck_radius
                 and (replan_stuck or time_stuck)
-                and (
-                    not (self._l3_explore_hardening or self._l2_explore_hardening)
-                    or self._cur_step >= self._retreat_resume_block_until_step
-                )
+                and self._cur_step >= self._retreat_resume_block_until_step
             ):
                 center = self.planner.get_last_selected_cluster_center()
                 exclude_xy = center if center is not None else self._current_waypoint[:2]
@@ -316,34 +339,43 @@ class SearchMission(BaseMission):
                             target_pos=self._explore_cmd_wp(wp_other),
                             target_rpy=rpy,
                         )
-                # 无其他区域或新航点仍在同片区域：向起飞点撤退
-                retreat_wp = self.planner.get_waypoint_towards_goal(
-                    drone_pos=pos,
-                    goal_pos=self._home_pos[:2],
-                    lookahead_dist=1.0,
-                    goal_search_radius=1.2,
-                )
+                # 无其他区域或新航点仍在同片区域：逃向距 home 第 rank 远的全局 frontier
+                retreat_wp = self._navigate_toward_global_frontier(pos, rank=self._escape_frontier_rank)
                 if retreat_wp is None:
-                    home_xy = self._home_pos[:2]
-                    pos_xy = pos[:2]
-                    retreat_xy = pos_xy + 0.7 * (home_xy - pos_xy)
-                    retreat_wp = np.array(
-                        [retreat_xy[0], retreat_xy[1], self.takeoff_height],
-                        dtype=float,
+                    # 无可达全局 frontier，退化为向 home 撤退
+                    retreat_wp = self.planner.get_waypoint_towards_goal(
+                        drone_pos=pos,
+                        goal_pos=self._home_pos[:2],
+                        lookahead_dist=1.0,
+                        goal_search_radius=1.2,
                     )
-                else:
-                    retreat_wp = self._explore_cmd_wp(retreat_wp)
+                    if retreat_wp is None:
+                        pos_xy = pos[:2]
+                        home_xy = self._home_pos[:2]
+                        retreat_xy = pos_xy + 0.7 * (home_xy - pos_xy)
+                        retreat_wp = np.array(
+                            [retreat_xy[0], retreat_xy[1], self.takeoff_height], dtype=float,
+                        )
+                    else:
+                        retreat_wp = self._explore_cmd_wp(retreat_wp)
+                # 下次仍卡死则尝试第二远的 frontier
+                self._escape_frontier_rank += 1
                 self._current_waypoint = retreat_wp
                 self._region_retreat_until_step = self._cur_step + self._region_retreat_duration_steps
                 self._last_frontier_pick_step = self._cur_step
                 self._region_replan_count = 0
                 self._reset_stuck_anchor(pos)
-                self._log("EXPLORE: region stuck, retreat toward home")
+                self._log(f"EXPLORE: region stuck, escape to global frontier rank={self._escape_frontier_rank - 1}")
                 return Command(target_pos=retreat_wp, target_rpy=rpy)
 
         # 判断是否到达当前 frontier 航点（水平距离）
         dist_xy = float(np.linalg.norm(pos[:2] - self._current_waypoint[:2]))
         force_replan = self._is_explore_stuck(pos)
+        # 当前航点路径被新检测到的障碍物堵住 → 立即重规划
+        if not force_replan and dist_xy > self.waypoint_reach_dist:
+            if not self.planner._is_directly_reachable(pos[:2], self._current_waypoint[:2]):
+                force_replan = True
+                self._reset_stuck_anchor(pos)
         if dist_xy < self.waypoint_reach_dist or force_replan:
             if (not force_replan) and (
                 (self._cur_step - self._last_frontier_pick_step) < self.frontier_replan_cooldown_steps
@@ -352,6 +384,27 @@ class SearchMission(BaseMission):
                     target_pos=self._explore_cmd_wp(self._current_waypoint),
                     target_rpy=rpy,
                 )
+
+            # 所有 frontier 中心都较远（>2m）→ 当前房间已基本探索完，主动出房间
+            centers = self.planner.get_frontier_centers()
+            if centers and self._cur_step >= self._room_exit_cooldown_step:
+                nearest_center_dist = min(
+                    float(np.linalg.norm(np.asarray(c[:2], dtype=float) - pos[:2]))
+                    for c in centers
+                )
+                if nearest_center_dist > 2.0:
+                    exit_wp = self._navigate_toward_global_frontier(pos)
+                    if exit_wp is not None and float(np.linalg.norm(exit_wp[:2] - pos[:2])) > 0.15:
+                        self._current_waypoint = exit_wp
+                        self._room_exit_cooldown_step = self._cur_step + 60
+                        self._log(
+                            f"EXPLORE: all frontiers far ({nearest_center_dist:.1f}m), "
+                            f"room exit → {exit_wp.round(2)}"
+                        )
+                        return Command(
+                            target_pos=self._explore_cmd_wp(exit_wp),
+                            target_rpy=rpy,
+                        )
 
             # 卡住时排除当前航点所在 cluster；同区域已重规划多次时也排除当前方向；刚撤退完也排除原 cluster 以换房间
             exclude = None
@@ -488,16 +541,42 @@ class SearchMission(BaseMission):
                         self._region_anchor_pos = np.asarray(pos, dtype=float).copy()
                         self._region_anchor_step = self._cur_step
                         self._region_replan_count = 0
+                        self._escape_frontier_rank = 0  # 成功换区域，重置逃脱排名
                     elif float(np.linalg.norm(pos[:2] - self._region_anchor_pos[:2])) <= self._region_stuck_radius:
                         self._region_replan_count += 1
                     if force_replan:
                         self._log(f"EXPLORE: stuck, replan frontier → {wp.round(2)}")
                     else:
                         self._log(f"EXPLORE: next frontier → {wp.round(2)}")
+
+                    # 被障碍物困住检测：force_replan 后航点仍然极近，说明直线可达被障碍堵死
+                    # 切换到大步长 Dijkstra 导航（不做直线过滤），绕过障碍物群逃出去
+                    if force_replan and self.planner.get_frontier_centers():
+                        step_size = float(np.linalg.norm(wp[:2] - pos[:2]))
+                        if step_size < 0.20 and self._cur_step >= self._room_exit_cooldown_step:
+                            escape_wp = self._navigate_toward_global_frontier(pos)
+                            if escape_wp is not None and float(np.linalg.norm(escape_wp[:2] - pos[:2])) > step_size:
+                                wp = escape_wp
+                                self._current_waypoint = wp
+                                self._room_exit_cooldown_step = self._cur_step + 30
+                                self._log(f"EXPLORE: obstacle trap (step={step_size:.2f}m), escape → {wp.round(2)}")
+
                 self._last_frontier_pick_step = self._cur_step
                 if force_replan:
                     self._reset_stuck_anchor(pos)
             else:
+                # 当前位置无可达 frontier，但全局有 frontier → 主动出房间
+                if self.planner.get_frontier_centers():
+                    if self._cur_step >= self._room_exit_cooldown_step:
+                        exit_wp = self._navigate_toward_global_frontier(pos)
+                        if exit_wp is not None:
+                            self._current_waypoint = exit_wp
+                            self._room_exit_cooldown_step = self._cur_step + 60
+                            self._log(f"EXPLORE: room exit → global frontier {exit_wp.round(2)}")
+                            return Command(
+                                target_pos=self._explore_cmd_wp(exit_wp),
+                                target_rpy=rpy,
+                            )
                 # 没有更多 frontier，探索结束
                 cmd = self._try_transition_to_target_or_done(pos, rpy)
                 if cmd is not None:
@@ -627,19 +706,28 @@ class SearchMission(BaseMission):
             self._log("→ DONE")
             return Command(target_pos=self._home_pos.copy(), target_rpy=rpy)
 
-        # 悬停在目标上方，等待计时完成
-        return Command(target_pos=tpos.copy(), target_rpy=rpy)
+        # 悬停在目标上方，等待计时完成（避障层不应干扰精确悬停）
+        return Command(target_pos=tpos.copy(), target_rpy=rpy, info="inspect")
 
     def _handle_done(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
         home = self._home_pos.copy()
-        dist = float(np.linalg.norm(pos - home))
-        finished = dist < 1.0
+        dist = float(np.linalg.norm(pos[:2] - home[:2]))  # XY距离，避免巡航高度与初始高度差导致永远不触发
+        finished = dist < self.waypoint_reach_dist
         if finished:
+            if self._enable_delivery:
+                queue = self._build_delivery_queue()
+                if queue:
+                    self._deliver_queue = queue
+                    self._deliver_current_idx = 0
+                    self._deliver_hover_remaining = 0
+                    self._phase = _Phase.DELIVER
+                    self._log(f"DONE: arrived home → DELIVER ({len(queue)} targets)")
+                    return Command(target_pos=home, target_rpy=rpy, finished=False, info="delivery_start")
             self._log("DONE: returned home, mission complete")
             return Command(
                 target_pos=home,
                 target_rpy=rpy,
-                finished=finished,
+                finished=True,
                 info="mission_done",
             )
 
@@ -651,7 +739,7 @@ class SearchMission(BaseMission):
             self._done_stuck_anchor_dist = dist
             self._done_stuck_anchor_step = self._cur_step
         stuck_steps = self._cur_step - self._done_stuck_anchor_step
-        lookahead = 0.25 if stuck_steps > 80 else 0.45
+        lookahead = 0.25 if stuck_steps > 80 else 0.8
 
         # 沿栅格 FREE 路径返航，避免直线穿墙；只选与飞机直线可达的路径点
         wp = self.planner.get_waypoint_towards_goal(
@@ -666,10 +754,6 @@ class SearchMission(BaseMission):
                 wp[2] = self.takeoff_height
             else:
                 wp = np.array([float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float)
-            # 若路径点比当前位置更远离 home，说明路径绕远，直接飞 home 避免越飞越远
-            dist_wp_to_home = float(np.linalg.norm(wp[:2] - home[:2]))
-            if dist_wp_to_home > dist:
-                wp = home.copy()
             return Command(
                 target_pos=wp,
                 target_rpy=rpy,
@@ -693,7 +777,15 @@ class SearchMission(BaseMission):
         ray_dists = sensors.get("ray_dists")
         ray_dirs_world = sensors.get("ray_dirs_world")
         if ray_dists is not None and ray_dirs_world is not None:
-            self.planner.update(pos, ray_dists, ray_dirs_world)
+            dirs = np.asarray(ray_dirs_world, dtype=float)
+            dists = np.asarray(ray_dists, dtype=float)
+            # 只用水平射线更新 2D 栅格：倾斜射线会从墙底/顶越过，
+            # 其 XY 投影会错误地把墙另一侧的格子标为 FREE
+            if dirs.ndim == 2 and dirs.shape[1] >= 3:
+                horiz = np.abs(dirs[:, 2]) < 0.15
+                dirs = dirs[horiz]
+                dists = dists[horiz]
+            self.planner.update(pos, dists, dirs)
 
     def _pick_next_frontier(
         self, pos: np.ndarray, exclude_xy: Optional[np.ndarray] = None
@@ -704,12 +796,6 @@ class SearchMission(BaseMission):
         遇到 OCCUPIED 格才停下（UNKNOWN 格可穿越），返回最远安全点。
         exclude_xy: 卡住时传入当前航点，排除该方向上的 cluster，改选其他 frontier。
         """
-        inspected, discovered, _ = self.target_manager.get_progress()
-        if discovered == 0 and inspected == 0:
-            biased = self._pick_rightward_frontier(pos)
-            if biased is not None:
-                return biased
-
         wp = self.planner.get_next_waypoint(pos, exclude_xy=exclude_xy)
         if wp is None:
             return None
@@ -804,7 +890,9 @@ class SearchMission(BaseMission):
             return best_wp
         return None
 
-    def _pick_rightward_frontier(self, pos: np.ndarray) -> Optional[np.ndarray]:
+    def _pick_rightward_frontier(
+        self, pos: np.ndarray, exclude_xy: Optional[np.ndarray] = None, exclude_radius: float = 0.5
+    ) -> Optional[np.ndarray]:
         """
         Early exploration bias: before any target is discovered,
         prefer frontiers that progress to +x (toward right-side rooms).
@@ -814,10 +902,15 @@ class SearchMission(BaseMission):
             return None
 
         pos_xy = np.asarray(pos[:2], dtype=float)
+        excl = np.asarray(exclude_xy, dtype=float).reshape(2) if exclude_xy is not None else None
         best_wp: Optional[np.ndarray] = None
         best_score = -1e9
 
         for c in centers:
+            if excl is not None:
+                c_xy = np.asarray(c[:2], dtype=float)
+                if float(np.linalg.norm(c_xy - excl)) < exclude_radius:
+                    continue
             wp = self._clip_waypoint_to_safe(pos, c[:2])
             move = wp[:2] - pos_xy
             move_dist = float(np.linalg.norm(move))
@@ -1007,6 +1100,122 @@ class SearchMission(BaseMission):
     def _reset_stuck_anchor(self, pos: np.ndarray) -> None:
         self._stuck_anchor_pos = np.asarray(pos, dtype=float).copy()
         self._stuck_anchor_step = self._cur_step
+
+    def _navigate_toward_global_frontier(self, pos: np.ndarray, rank: int = 0) -> Optional[np.ndarray]:
+        """按距 home 距离降序排列所有可达 frontier，返回第 rank 个的局部航点。
+        优先排除卡死区域（距 region_anchor 1.5m 内）的 frontier；若排除后为空则不排除。
+        rank=0: 最远；rank=1: 第二远；依此类推。若 rank 超出范围则回退到最远。"""
+        centers = self.planner.get_frontier_centers()
+        if not centers:
+            return None
+        home_xy = np.asarray(self._home_pos[:2], dtype=float)
+        anchor_xy = np.asarray(self._region_anchor_pos[:2], dtype=float)
+        exclude_radius = 1.5
+
+        reachable: list = []
+        reachable_all: list = []  # 不排除卡死区域的备份
+        for center in centers:
+            center_xy = np.asarray(center[:2], dtype=float)
+            wp = self.planner.get_waypoint_towards_goal(
+                drone_pos=pos,
+                goal_pos=center_xy,
+                lookahead_dist=2.0,
+                goal_search_radius=1.5,
+            )
+            if wp is None:
+                continue
+            dist_from_home = float(np.linalg.norm(center_xy - home_xy))
+            dist_from_anchor = float(np.linalg.norm(center_xy - anchor_xy))
+            reachable_all.append((dist_from_home, wp))
+            if dist_from_anchor >= exclude_radius:
+                reachable.append((dist_from_home, wp))
+
+        # 排除卡死区域后若无剩余，退化为全集
+        candidates = reachable if reachable else reachable_all
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: -x[0])  # 距 home 最远的排第一
+        actual_rank = min(rank, len(candidates) - 1)
+        _, wp = candidates[actual_rank]
+        return np.array([float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float)
+
+    def _build_delivery_queue(self) -> list:
+        """收集已巡检目标，从 home 出发最近邻贪心排序，返回 [(tid, pos), ...]。"""
+        candidates = []
+        for tid, info in self.target_manager.targets.items():
+            if not info.inspected:
+                continue
+            pos = (
+                info.measured_position_at_inspect.copy()
+                if info.measured_position_at_inspect is not None
+                else info.position.copy()
+            )
+            candidates.append((int(tid), pos))
+        if not candidates:
+            return []
+        ordered = []
+        current_xy = np.asarray(self._home_pos[:2], dtype=float)
+        remaining = list(candidates)
+        while remaining:
+            dists = [
+                float(np.linalg.norm(np.asarray(p[:2], dtype=float) - current_xy))
+                for _, p in remaining
+            ]
+            best_i = int(np.argmin(np.asarray(dists, dtype=float)))
+            tid, pos = remaining.pop(best_i)
+            ordered.append((tid, pos))
+            current_xy = np.asarray(pos[:2], dtype=float)
+        return ordered
+
+    def _handle_deliver(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
+        """投递阶段：按队列顺序飞往每个已巡检目标，悬停投递后继续下一个。"""
+        hover_total = int(self._deliver_hover_secs * 48)
+
+        if self._deliver_current_idx >= len(self._deliver_queue):
+            self._log("DELIVER: all deliveries complete")
+            return Command(
+                target_pos=self._home_pos.copy(),
+                target_rpy=rpy,
+                finished=True,
+                info="delivery_done",
+            )
+
+        tid, target_pos = self._deliver_queue[self._deliver_current_idx]
+        hover = np.array(
+            [float(target_pos[0]), float(target_pos[1]), self.takeoff_height],
+            dtype=float,
+        )
+        dist_xy = float(np.linalg.norm(pos[:2] - hover[:2]))
+
+        if self._deliver_hover_remaining > 0:
+            self._deliver_hover_remaining -= 1
+            if self._deliver_hover_remaining == 0:
+                self._log(
+                    f"DELIVER: target {tid} delivered "
+                    f"({self._deliver_current_idx + 1}/{len(self._deliver_queue)})"
+                )
+                self._deliver_current_idx += 1
+            return Command(target_pos=hover, target_rpy=rpy, finished=False, info="delivering")
+
+        if dist_xy < self.waypoint_reach_dist:
+            self._deliver_hover_remaining = hover_total
+            self._log(f"DELIVER: reached target {tid}, hovering {self._deliver_hover_secs:.1f}s")
+            return Command(target_pos=hover, target_rpy=rpy, finished=False, info="delivering")
+
+        wp = self.planner.get_waypoint_towards_goal(
+            drone_pos=pos,
+            goal_pos=target_pos[:2],
+            lookahead_dist=self.goto_path_lookahead_dist,
+            goal_search_radius=self.goto_goal_search_radius,
+        )
+        if wp is not None:
+            nav_wp = np.array(
+                [float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float
+            )
+            return Command(target_pos=nav_wp, target_rpy=rpy, finished=False, info="delivering")
+
+        return Command(target_pos=hover, target_rpy=rpy, finished=False, info="delivering")
 
     def _log(self, msg: str) -> None:
         if self.verbose:

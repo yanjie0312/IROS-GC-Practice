@@ -66,13 +66,17 @@ class Scenario:
     planner_type: str = "POTENTIAL"
 
 
-# Explicit proposal-aligned profiles.
-# Each level includes wind, noise, delay, dropout, payload, timeout,
-# plus obstacle/layout complexity.
+# 2×2 正交难度设计：地图复杂度 × 风扰条件
+#
+#              简单地图(2房间)   复杂地图(3房间)
+#   无风:          L0               L1
+#   有风(轻微):    L2               L3
+#
 PROFILE_LIBRARY: Dict[str, Dict] = {
+    # L0：简单地图 + 无风。基准场景，验证导航与巡检核心能力。
     "L0_easy": {
         "layout_name": "apt_2room1hall",
-        "num_obstacles": 4,
+        "num_obstacles": 3,
         "num_nofly": 0,
         "num_targets": 2,
         "wind_std": 0.0,
@@ -93,15 +97,40 @@ PROFILE_LIBRARY: Dict[str, Dict] = {
         "delay_steps": 0,
         "timeout_steps": DEFAULT_TIMEOUT_STEPS,
     },
+    # L1：复杂地图(3房间) + 无风。测试多房间探索与路径规划能力。
     "L1_mild": {
+        "layout_name": "apt_3room2hall",
+        "num_obstacles": 5,
+        "num_nofly": 0,
+        "num_targets": 3,
+        "wind_std": 0.0,
+        "wind_bias_xy": (0.0, 0.0),
+        "gust_prob": 0.0,
+        "gust_strength": 0.0,
+        "physics_mode": "nominal",
+        "pos_noise_std": 0.0,
+        "yaw_noise_std": 0.0,
+        "ray_noise_std": 0.0,
+        "target_pos_noise_std": 0.0,
+        "target_pos_bias": 0.0,
+        "target_range_noise_std": 0.0,
+        "target_bearing_noise_std": 0.0,
+        "target_range_bias": 0.0,
+        "target_false_negative_prob": 0.0,
+        "dropout_prob": 0.0,
+        "delay_steps": 0,
+        "timeout_steps": DEFAULT_TIMEOUT_STEPS,
+    },
+    # L2：简单地图(2房间) + 轻微风扰。与L0地图相同，单独测试抗风能力。
+    "L2_medium": {
         "layout_name": "apt_2room1hall",
-        "num_obstacles": 6,
+        "num_obstacles": 3,
         "num_nofly": 0,
         "num_targets": 2,
-        "wind_std": 0.08,
-        "wind_bias_xy": (0.02, 0.00),
-        "gust_prob": 0.03,
-        "gust_strength": 0.10,
+        "wind_std": 0.03,
+        "wind_bias_xy": (0.01, 0.00),
+        "gust_prob": 0.01,
+        "gust_strength": 0.04,
         "physics_mode": "nominal",
         "pos_noise_std": 0.01,
         "yaw_noise_std": 0.01,
@@ -111,44 +140,22 @@ PROFILE_LIBRARY: Dict[str, Dict] = {
         "target_range_noise_std": 0.01,
         "target_bearing_noise_std": 0.01,
         "target_range_bias": 0.0,
-        "target_false_negative_prob": 0.02,
-        "dropout_prob": 0.01,
+        "target_false_negative_prob": 0.0,
+        "dropout_prob": 0.0,
         "delay_steps": 0,
-        "timeout_steps": int(DEFAULT_TIMEOUT_STEPS * 0.95),
+        "timeout_steps": DEFAULT_TIMEOUT_STEPS,
     },
-    "L2_medium": {
-        "layout_name": "apt_3room2hall",
-        "num_obstacles": 8,
-        "num_nofly": 1,
-        "num_targets": 3,
-        "wind_std": 0.10,
-        "wind_bias_xy": (0.03, 0.01),
-        "gust_prob": 0.04,
-        "gust_strength": 0.12,
-        "physics_mode": "drag",
-        "pos_noise_std": 0.01,
-        "yaw_noise_std": 0.01,
-        "ray_noise_std": 0.01,
-        "target_pos_noise_std": 0.01,
-        "target_pos_bias": 0.0,
-        "target_range_noise_std": 0.01,
-        "target_bearing_noise_std": 0.01,
-        "target_range_bias": 0.0,
-        "target_false_negative_prob": 0.02,
-        "dropout_prob": 0.01,
-        "delay_steps": 1,
-        "timeout_steps": int(DEFAULT_TIMEOUT_STEPS * 0.90),
-    },
+    # L3：复杂地图(3房间) + 轻微风扰。综合最高难度：多房间探索 + 风扰叠加。
     "L3_hard": {
         "layout_name": "apt_3room2hall",
-        "num_obstacles": 12,
-        "num_nofly": 2,
-        "num_targets": 4,
-        "wind_std": 0.15,
-        "wind_bias_xy": (0.04, 0.01),
-        "gust_prob": 0.06,
-        "gust_strength": 0.15,
-        "physics_mode": "ground_effect",
+        "num_obstacles": 5,
+        "num_nofly": 0,
+        "num_targets": 3,
+        "wind_std": 0.03,
+        "wind_bias_xy": (0.01, 0.00),
+        "gust_prob": 0.01,
+        "gust_strength": 0.04,
+        "physics_mode": "nominal",
         "pos_noise_std": 0.01,
         "yaw_noise_std": 0.01,
         "ray_noise_std": 0.01,
@@ -157,10 +164,10 @@ PROFILE_LIBRARY: Dict[str, Dict] = {
         "target_range_noise_std": 0.01,
         "target_bearing_noise_std": 0.01,
         "target_range_bias": 0.0,
-        "target_false_negative_prob": 0.02,
-        "dropout_prob": 0.01,
-        "delay_steps": 1,
-        "timeout_steps": int(DEFAULT_TIMEOUT_STEPS * 0.80),
+        "target_false_negative_prob": 0.0,
+        "dropout_prob": 0.0,
+        "delay_steps": 0,
+        "timeout_steps": 500 * 48,
     },
 }
 
@@ -211,7 +218,7 @@ DEG_LEVEL_LIBRARY: Dict[str, Dict] = {
         "dropout_prob": 0.01,
         "delay_steps": 0,
         "payload_mass_delta": 0.0015,
-        "timeout_steps": int(DEFAULT_TIMEOUT_STEPS * 0.95),
+        "timeout_steps": DEFAULT_TIMEOUT_STEPS,
     },
     "l2": {
         "wind_std": 0.18,
@@ -231,7 +238,7 @@ DEG_LEVEL_LIBRARY: Dict[str, Dict] = {
         "dropout_prob": 0.05,
         "delay_steps": 1,
         "payload_mass_delta": 0.0030,
-        "timeout_steps": int(DEFAULT_TIMEOUT_STEPS * 0.90),
+        "timeout_steps": DEFAULT_TIMEOUT_STEPS,
     },
     "l3": {
         "wind_std": 0.30,
@@ -251,7 +258,7 @@ DEG_LEVEL_LIBRARY: Dict[str, Dict] = {
         "dropout_prob": 0.10,
         "delay_steps": 2,
         "payload_mass_delta": 0.0050,
-        "timeout_steps": int(DEFAULT_TIMEOUT_STEPS * 0.80),
+        "timeout_steps": DEFAULT_TIMEOUT_STEPS,
     },
 }
 
@@ -291,14 +298,6 @@ def make_scenario(
     map_level: Optional[str] = None,
     deg_level: Optional[str] = None,
 ) -> Scenario:
-    """
-    Supported usages:
-    1) make_scenario("L0_easy", seed=42)
-    2) make_scenario(map_level="med", deg_level="l2", seed=42)
-    3) Backward compatible:
-       - "easy"/"med"/"hard"
-       - "l0"/"l1"/"l2"/"l3"
-    """
     if map_level is not None or deg_level is not None:
         ml = (map_level or "easy").lower().strip()
         dl = (deg_level or "l0").lower().strip()
@@ -310,10 +309,8 @@ def make_scenario(
 
     n = raw.lower()
     if n in MAP_LEVEL_LIBRARY:
-        # Legacy map-only call means map complexity with no degradation.
         return _make_from_axes(n, "l0", seed)
     if n in DEG_LEVEL_LIBRARY:
-        # Legacy degradation-only call defaults to medium map complexity.
         return _make_from_axes("med", n, seed)
 
     raise ValueError(

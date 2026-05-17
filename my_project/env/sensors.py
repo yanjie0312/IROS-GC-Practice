@@ -30,8 +30,8 @@ def build_default_ray_dirs() -> np.ndarray:
     """
     dirs: List[np.ndarray] = []
 
-    # 16 rays on horizontal plane
-    for deg in np.linspace(0.0, 360.0, 16, endpoint=False):
+    # 32 rays on horizontal plane
+    for deg in np.linspace(0.0, 360.0, 32, endpoint=False):
         rad = np.deg2rad(float(deg))
         dirs.append(np.array([np.cos(rad), np.sin(rad), 0.0], dtype=float))
 
@@ -101,9 +101,9 @@ class SensorSuite:
         arena_handle: Optional[Any] = None,
         ray_dirs_body: Optional[np.ndarray] = None,
         ray_length: float = 2.5,
-        ray_start_offset: float = 0.06,
+        ray_start_offset: float = 0.02,
         closest_query_distance: float = 0.8,
-        collision_distance: float = 0.02,
+        collision_distance: float = 0.0,
         target_mode: str = "hybrid",  # "gt" | "camera" | "hybrid"
         target_detect_range: float = 2.5,
         target_fov_deg: float = 100.0,
