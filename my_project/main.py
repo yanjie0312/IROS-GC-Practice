@@ -720,12 +720,14 @@ def main():
 
             delta_xy = cmd.target_pos[:2] - pkt["pos"][:2]
             dist_xy = float(np.linalg.norm(delta_xy))
-            if collision or min_dist < 0.18:
-                max_xy_step = 0.14
+            if collision or min_dist < 0.10:
+                max_xy_step = 0.20  # 紧急逃脱需要足够步长才能有效脱困，不受近墙减速限制
+            elif min_dist < 0.18:
+                max_xy_step = 0.10
             elif min_dist < 0.30:
-                max_xy_step = 0.20
+                max_xy_step = 0.18
             elif min_dist < 0.45:
-                max_xy_step = 0.30
+                max_xy_step = 0.28
             else:
                 max_xy_step = 0.45
 
@@ -783,10 +785,10 @@ def main():
         z = float(pkt["pos"][2])
         roll, pitch = float(pkt["rpy"][0]), float(pkt["rpy"][1])
 
-        if light_hardening_enabled and z >= low_z_trigger + 0.03:
+        if z >= low_z_trigger + 0.03:
             low_z_recovery_may_restart = True
 
-        if light_hardening_enabled and z < low_z_trigger and i > env.CTRL_FREQ:
+        if z < low_z_trigger and i > env.CTRL_FREQ:
             # 仅在「允许新一轮」且当前窗口已耗尽时启动恢复，避免每帧 max(remaining,12) 续期导致永远无法坠毁退出
             if low_z_recovery_remaining <= 0 and (
                 low_z_recovery_may_restart or (hardening_enabled and low_z_recovery_restart_left > 0)
@@ -803,7 +805,7 @@ def main():
                         f"[{tag}-recovery] low-z trigger at t={t:.1f}s, z={z:.2f}, steps={low_z_recovery_remaining}"
                     )
 
-        if light_hardening_enabled and low_z_recovery_remaining > 0 and not cmd.finished:
+        if low_z_recovery_remaining > 0 and not cmd.finished:
             # 保高度 + 极小横向步长，给姿态恢复时间
             low_z_recovery_remaining -= 1
             cmd.target_pos[2] = max(float(cmd.target_pos[2]), low_z_guard_target)

@@ -20,7 +20,7 @@ import numpy as np
 # ── 配置 ────────────────────────────────────────────────────────────────────
 LEVELS   = ["L0_easy", "L1_mild", "L2_medium", "L3_hard"]
 # LEVELS   = ["L3_hard"]
-N_RUNS   = 10
+N_RUNS   = 5
 BASE_SEED = 0       # 每个 level 使用 seed = BASE_SEED + run_idx
 
 # ── 输出目录 ─────────────────────────────────────────────────────────────────
