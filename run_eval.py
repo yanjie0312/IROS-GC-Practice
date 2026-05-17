@@ -18,8 +18,8 @@ from pathlib import Path
 import numpy as np
 
 # ── 配置 ────────────────────────────────────────────────────────────────────
-# LEVELS   = ["L0_easy", "L1_mild", "L2_medium", "L3_hard"]
-LEVELS   = ["L3_hard"]
+LEVELS   = ["L0_easy", "L1_mild", "L2_medium", "L3_hard"]
+# LEVELS   = ["L3_hard"]
 N_RUNS   = 10
 BASE_SEED = 0       # 每个 level 使用 seed = BASE_SEED + run_idx
 
@@ -44,7 +44,7 @@ def run_one(level: str, seed: int) -> dict:
 def compute_metrics(results: list[dict]) -> dict:
     """
     Rs  : 成功率（全部目标在时限内巡检完）
-    Rc  : 碰撞率（曾与任何障碍接触）
+    Rc  : 坠毁率（高度跌破阈值导致任务终止）
     T_avg: 成功 episode 的平均任务时间（s）
     ICR : 每 episode 平均目标巡检完成率
     """
@@ -53,7 +53,7 @@ def compute_metrics(results: list[dict]) -> dict:
         return {"Rs": 0.0, "Rc": 0.0, "T_avg": float("nan"), "ICR": 0.0, "n": 0}
 
     Rs  = sum(1 for r in results if r["success"]) / n
-    Rc  = sum(1 for r in results if r["had_obstacle_contact"]) / n
+    Rc  = sum(1 for r in results if r.get("termination_reason") == "crash") / n
 
     success_times = [r["flight_time_sec"] for r in results if r["success"]]
     T_avg = float(np.mean(success_times)) if success_times else float("nan")

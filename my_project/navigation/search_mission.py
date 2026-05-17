@@ -703,7 +703,7 @@ class SearchMission(BaseMission):
 
     def _handle_done(self, pos: np.ndarray, rpy: np.ndarray) -> Command:
         home = self._home_pos.copy()
-        dist = float(np.linalg.norm(pos - home))
+        dist = float(np.linalg.norm(pos[:2] - home[:2]))  # XY距离，避免巡航高度与初始高度差导致永远不触发
         finished = dist < self.waypoint_reach_dist
         if finished:
             if self._enable_delivery:

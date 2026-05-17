@@ -723,7 +723,9 @@ def main():
             if collision or min_dist < 0.18:
                 max_xy_step = 0.14
             elif min_dist < 0.30:
-                max_xy_step = 0.24
+                max_xy_step = 0.20
+            elif min_dist < 0.45:
+                max_xy_step = 0.30
             else:
                 max_xy_step = 0.45
 
