@@ -1103,14 +1103,17 @@ class SearchMission(BaseMission):
 
     def _navigate_toward_global_frontier(self, pos: np.ndarray, rank: int = 0) -> Optional[np.ndarray]:
         """按距 home 距离降序排列所有可达 frontier，返回第 rank 个的局部航点。
+        优先排除卡死区域（距 region_anchor 1.5m 内）的 frontier；若排除后为空则不排除。
         rank=0: 最远；rank=1: 第二远；依此类推。若 rank 超出范围则回退到最远。"""
         centers = self.planner.get_frontier_centers()
         if not centers:
             return None
         home_xy = np.asarray(self._home_pos[:2], dtype=float)
+        anchor_xy = np.asarray(self._region_anchor_pos[:2], dtype=float)
+        exclude_radius = 1.5
 
-        # 只保留可达的 frontier，按距 home 距离降序排列
         reachable: list = []
+        reachable_all: list = []  # 不排除卡死区域的备份
         for center in centers:
             center_xy = np.asarray(center[:2], dtype=float)
             wp = self.planner.get_waypoint_towards_goal(
@@ -1122,14 +1125,19 @@ class SearchMission(BaseMission):
             if wp is None:
                 continue
             dist_from_home = float(np.linalg.norm(center_xy - home_xy))
-            reachable.append((dist_from_home, wp))
+            dist_from_anchor = float(np.linalg.norm(center_xy - anchor_xy))
+            reachable_all.append((dist_from_home, wp))
+            if dist_from_anchor >= exclude_radius:
+                reachable.append((dist_from_home, wp))
 
-        if not reachable:
+        # 排除卡死区域后若无剩余，退化为全集
+        candidates = reachable if reachable else reachable_all
+        if not candidates:
             return None
 
-        reachable.sort(key=lambda x: -x[0])  # 距 home 最远的排第一
-        actual_rank = min(rank, len(reachable) - 1)
-        _, wp = reachable[actual_rank]
+        candidates.sort(key=lambda x: -x[0])  # 距 home 最远的排第一
+        actual_rank = min(rank, len(candidates) - 1)
+        _, wp = candidates[actual_rank]
         return np.array([float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float)
 
     def _build_delivery_queue(self) -> list:
