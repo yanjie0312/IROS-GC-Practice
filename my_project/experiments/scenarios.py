@@ -167,7 +167,7 @@ PROFILE_LIBRARY: Dict[str, Dict] = {
         "target_false_negative_prob": 0.0,
         "dropout_prob": 0.0,
         "delay_steps": 0,
-        "timeout_steps": DEFAULT_TIMEOUT_STEPS,
+        "timeout_steps": 500 * 48,
     },
 }
 

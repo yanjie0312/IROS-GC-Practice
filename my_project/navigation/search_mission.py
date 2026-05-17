@@ -113,11 +113,7 @@ class SearchMission(BaseMission):
         self._retreat_resume_cooldown_steps = 120
         self._retreat_resume_block_until_step = -1
         # region 锚点更新阈值：越小越容易判定“已经换到新区域”
-        self._region_anchor_update_dist = 1.5
-        if self._l2_explore_hardening:
-            # L2：当位于门洞附近时，位移可能达不到 1.5m；过大的阈值会导致 region 锚点长期不更新
-            # 从而覆盖率停留在局部口袋，出现“出来又回去”的往返循环。
-            self._region_anchor_update_dist = 1.2
+        self._region_anchor_update_dist = 1.0
         self._retreat_waypoint_min_dist = 1.0
         # 同区域内重规划次数超过此次数也视为区域卡住（不必等 400 步）
         self._region_stuck_replan_threshold = 5   # 原10次重规划触发撤退，改为5次更快逃脱
@@ -735,7 +731,7 @@ class SearchMission(BaseMission):
             self._done_stuck_anchor_dist = dist
             self._done_stuck_anchor_step = self._cur_step
         stuck_steps = self._cur_step - self._done_stuck_anchor_step
-        lookahead = 0.25 if stuck_steps > 80 else 0.45
+        lookahead = 0.25 if stuck_steps > 80 else 0.8
 
         # 沿栅格 FREE 路径返航，避免直线穿墙；只选与飞机直线可达的路径点
         wp = self.planner.get_waypoint_towards_goal(
@@ -792,12 +788,6 @@ class SearchMission(BaseMission):
         遇到 OCCUPIED 格才停下（UNKNOWN 格可穿越），返回最远安全点。
         exclude_xy: 卡住时传入当前航点，排除该方向上的 cluster，改选其他 frontier。
         """
-        inspected, discovered, _ = self.target_manager.get_progress()
-        if discovered == 0 and inspected == 0:
-            biased = self._pick_rightward_frontier(pos)
-            if biased is not None:
-                return biased
-
         wp = self.planner.get_next_waypoint(pos, exclude_xy=exclude_xy)
         if wp is None:
             return None
@@ -892,7 +882,9 @@ class SearchMission(BaseMission):
             return best_wp
         return None
 
-    def _pick_rightward_frontier(self, pos: np.ndarray) -> Optional[np.ndarray]:
+    def _pick_rightward_frontier(
+        self, pos: np.ndarray, exclude_xy: Optional[np.ndarray] = None, exclude_radius: float = 0.5
+    ) -> Optional[np.ndarray]:
         """
         Early exploration bias: before any target is discovered,
         prefer frontiers that progress to +x (toward right-side rooms).
@@ -902,10 +894,15 @@ class SearchMission(BaseMission):
             return None
 
         pos_xy = np.asarray(pos[:2], dtype=float)
+        excl = np.asarray(exclude_xy, dtype=float).reshape(2) if exclude_xy is not None else None
         best_wp: Optional[np.ndarray] = None
         best_score = -1e9
 
         for c in centers:
+            if excl is not None:
+                c_xy = np.asarray(c[:2], dtype=float)
+                if float(np.linalg.norm(c_xy - excl)) < exclude_radius:
+                    continue
             wp = self._clip_waypoint_to_safe(pos, c[:2])
             move = wp[:2] - pos_xy
             move_dist = float(np.linalg.norm(move))
@@ -1101,9 +1098,9 @@ class SearchMission(BaseMission):
         centers = self.planner.get_frontier_centers()
         if not centers:
             return None
-        pos_xy = np.asarray(pos[:2], dtype=float)
+        home_xy = np.asarray(self._home_pos[:2], dtype=float)
         best_wp = None
-        best_dist = float("inf")
+        best_dist = 0.0
         for center in centers:
             center_xy = np.asarray(center[:2], dtype=float)
             wp = self.planner.get_waypoint_towards_goal(
@@ -1114,8 +1111,8 @@ class SearchMission(BaseMission):
             )
             if wp is None:
                 continue
-            dist = float(np.linalg.norm(center_xy - pos_xy))
-            if dist < best_dist:
+            dist = float(np.linalg.norm(center_xy - home_xy))  # 距离 home 最远的 frontier
+            if dist > best_dist:
                 best_dist = dist
                 best_wp = np.array(
                     [float(wp[0]), float(wp[1]), self.takeoff_height], dtype=float

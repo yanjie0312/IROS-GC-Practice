@@ -103,7 +103,7 @@ class SensorSuite:
         ray_length: float = 2.5,
         ray_start_offset: float = 0.02,
         closest_query_distance: float = 0.8,
-        collision_distance: float = 0.02,
+        collision_distance: float = 0.0,
         target_mode: str = "hybrid",  # "gt" | "camera" | "hybrid"
         target_detect_range: float = 2.5,
         target_fov_deg: float = 100.0,

@@ -421,7 +421,7 @@ def main():
         inflation_cells=1,
     )
     # L3 下：对“目标被障碍半封堵”的情况更保守，避免 GOTO_TARGET<->EXPLORE 高频抖动
-    target_retry_cooldown_steps = 60
+    target_retry_cooldown_steps = 120
     goto_goal_search_radius = 1.40
     inspect_hover_dist = 0.4
     if hardening_enabled:
@@ -455,7 +455,7 @@ def main():
     manager = MissionManager(
         mission=mission,
         avoidance_layer=AvoidanceLayer(
-            d0=0.8,
+            d0=0.5,
             k_rep=0.5,
             alpha=0.45,
             min_dist_emergency=0.15,
@@ -491,7 +491,7 @@ def main():
     # 8) 主循环
     trajectory: list = []   # 记录飞行轨迹，用于结束后绘图
     START = time.time()
-    # 运行时长直接用 scenario 的 timeout_steps（统一 300s）
+    # 运行时长直接用 scenario 的 timeout_steps（L0/L1/L2=300s，L3=500s）
     steps = int(max(1, scenario.timeout_steps))
     # 防坠补丁参数（L2 轻量，L3 全量）
     z_guard = CRUISE_HEIGHT - (0.16 if light_hardening_enabled and not hardening_enabled else 0.18)
@@ -607,6 +607,10 @@ def main():
                     lifeTime=0.0,
                     physicsClientId=PYB_CLIENT,
                 )
+
+        # 全局高度保护：z 过低时主动拉高目标点，防止 PID 倾斜导致坠毁
+        if not cmd.finished and float(pkt["pos"][2]) < 0.25 and i > env.CTRL_FREQ:
+            cmd.target_pos[2] = max(float(cmd.target_pos[2]), CRUISE_HEIGHT + 0.10)
 
         # 限制水平步长，防止 PID 过大倾斜（目标点离当前位置过远会导致大倾角）
         if not cmd.finished:
@@ -761,9 +765,9 @@ def main():
                 cmd.target_pos = limited
 
             # Hard-bound commands to stay inside apartment envelope.
-            # 0.20m 与 inflation_cells=1 的 Dijkstra 安全带对齐（外墙 OCCUPIED + 1格膨胀 = 0.20m 安全边界）
-            cmd.target_pos[0] = float(np.clip(cmd.target_pos[0], 0.20, W - 0.20))
-            cmd.target_pos[1] = float(np.clip(cmd.target_pos[1], -H_layout + 0.20, H_layout - 0.20))
+            # 0.30m 给 PID 留足超调余量（实测超调约 0.15-0.17m），防止外墙碰撞
+            cmd.target_pos[0] = float(np.clip(cmd.target_pos[0], 0.30, W - 0.30))
+            cmd.target_pos[1] = float(np.clip(cmd.target_pos[1], -H_layout + 0.30, H_layout - 0.30))
 
         # 每 5 秒打印进度
         if i % (env.CTRL_FREQ * 5) == 0:
@@ -819,12 +823,11 @@ def main():
                 cmd.target_pos[:2] = np.asarray(pkt["pos"][:2], dtype=float).copy()
 
         crashed = z < 0.08  # 高度低于 8cm 视为落地坠毁
-        if light_hardening_enabled:
-            if crashed:
-                low_z_crash_frames += 1
-            elif z > 0.12:
-                low_z_crash_frames = 0
-            crashed = low_z_crash_frames >= low_z_crash_frames_thresh
+        if crashed:
+            low_z_crash_frames += 1
+        elif z > 0.12:
+            low_z_crash_frames = 0
+        crashed = low_z_crash_frames >= low_z_crash_frames_thresh
 
         if crashed and i > env.CTRL_FREQ and (not light_hardening_enabled or low_z_recovery_remaining <= 0):  # 跳过最初 1 秒的起飞抖动
             inspected, discovered, total = target_manager.get_progress()
